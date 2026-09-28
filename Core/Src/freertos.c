@@ -47,6 +47,8 @@
 /* USER CODE BEGIN Variables */
 volatile uint8_t i2c_found[8];  // list of addresses that answered (room for 8)
 volatile uint8_t i2c_count = 0; // how many answered
+volatile float temperature_c = 0; // latest temperature in °C
+volatile float humidity_pct = 0;  // latest humidity in %
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
@@ -161,19 +163,44 @@ void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
   /* Infinite loop */
-  for (uint8_t addr = 1; addr < 128; addr++) // try every 7-bit I2C address
+  uint8_t cmd[3]; // bytes we send to the sensor
+  uint8_t rx[7];  // bytes we get back
+
+  vTaskDelay(pdMS_TO_TICKS(40)); // AHT20 needs 40 ms after power-up
+
+  HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 1, 100); // read the status byte
+  if ((rx[0] & 0x08) == 0) // bit 3 = calibrated? if not...
   {
-    if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) ==
-        HAL_OK) // ask: "anyone at this address?"
-    {
-      if (i2c_count < 8)
-        i2c_found[i2c_count++] = addr; // yes: save the address
-    }
+    cmd[0] = 0xBE;
+    cmd[1] = 0x08;
+    cmd[2] = 0x00; // ...the "initialize" command
+    HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100); // send it
+    vTaskDelay(pdMS_TO_TICKS(10));                           // give it 10 ms
   }
-  for(;;)
-  {
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-    vTaskDelay(pdMS_TO_TICKS(500));
+
+  for (;;) {
+    cmd[0] = 0xAC;
+    cmd[1] = 0x33;
+    cmd[2] = 0x00; // the "start measurement" command
+    HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100); // send it
+    vTaskDelay(
+        pdMS_TO_TICKS(80)); // measuring takes ~80 ms; CPU is free meanwhile
+    HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 7,
+                           100); // read status + 5 data bytes + CRC
+
+    if ((rx[0] & 0x80) == 0) // bit 7 = busy; 0 means the data is ready
+    {
+      uint32_t raw_h = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) |
+                       (rx[3] >> 4); // 20-bit humidity
+      uint32_t raw_t = (((uint32_t)rx[3] & 0x0F) << 16) |
+                       ((uint32_t)rx[4] << 8) | rx[5]; // 20-bit temperature
+      humidity_pct =
+          raw_h * 100.0f / 1048576.0f; // datasheet formula (1048576 = 2^20)
+      temperature_c = raw_t * 200.0f / 1048576.0f - 50.0f; // datasheet formula
+    }
+
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // blink = "still alive"
+    vTaskDelay(pdMS_TO_TICKS(1000));        // one reading per second
   }
   /* USER CODE END StartDefaultTask */
 }
