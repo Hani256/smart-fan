@@ -25,7 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "i2c.h" // gives this file access to hi2c1, the I2C1 handle CubeMX created
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,8 +45,10 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-
+volatile uint8_t i2c_found[8];  // list of addresses that answered (room for 8)
+volatile uint8_t i2c_count = 0; // how many answered
 /* USER CODE END Variables */
+
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
@@ -159,6 +161,15 @@ void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
   /* Infinite loop */
+  for (uint8_t addr = 1; addr < 128; addr++) // try every 7-bit I2C address
+  {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) ==
+        HAL_OK) // ask: "anyone at this address?"
+    {
+      if (i2c_count < 8)
+        i2c_found[i2c_count++] = addr; // yes: save the address
+    }
+  }
   for(;;)
   {
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
