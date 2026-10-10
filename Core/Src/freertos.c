@@ -39,6 +39,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// PID fan controller. Tune these.
+#define TEMP_SETPOINT_C  23.5f   // target temperature: above this the fan starts
+#define PID_KP           20.0f   // P: % of fan speed per degree above the setpoint
+#define PID_KI            0.5f   // I: % added per second, per degree above the setpoint
+#define PID_KD            5.0f   // D: % per (degree per second) of rising temperature
+#define PID_DT            1.0f   // control period in seconds (FanTask runs once per second)
+#define FAN_MIN_DUTY      5      // below this the fan stops anyway, so treat it as off
 
 /* USER CODE END PD */
 
@@ -52,7 +59,7 @@
 volatile float temperature_c = 0; // latest temperature in C
 volatile float humidity_pct = 0;  // latest humidity in %
 
-volatile uint8_t  fan_duty_pct = 30; // requested fan speed, 0-100 % (change it live in the debugger!)
+volatile uint8_t  fan_duty_pct = 0;  // current fan speed, 0-100 %, set automatically from the temperature
 volatile uint32_t fan_rpm = 0;       // measured fan speed
 volatile uint32_t tach_pulses = 0;   // pulses counted by the TIM2 interrupt since the last reading
 /* USER CODE END Variables */
@@ -227,7 +234,7 @@ void SensorTask(void *argument)
     snprintf(line, sizeof(line), "H %d.%d %%", h10 / 10, h10 % 10);  // e.g. "H 45.2 %"
     ssd1306_WriteString(line, Font_11x18, White);                    // draw it
     ssd1306_SetCursor(0, 44);                                        // third line
-    snprintf(line, sizeof(line), "F %lu rpm", (unsigned long)fan_rpm); // e.g. "F 1500 rpm"
+    snprintf(line, sizeof(line), "F %lu %u%%", (unsigned long)fan_rpm, fan_duty_pct); // e.g. "F 1500 40%"
     ssd1306_WriteString(line, Font_11x18, White);                    // draw it
     ssd1306_UpdateScreen();                                          // send the whole buffer to the OLED
 
@@ -240,10 +247,37 @@ void FanTask(void *argument)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);        // start the 25 kHz PWM signal on PA8
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);      // start tach capture on PA5, interrupt on every pulse
 
+  float integral = 0.0f;                           // I term: the error summed over time, in %
+  float prev_t = 0.0f;                             // temperature one period ago, for the D term
+  uint8_t first = 1;                               // no previous temperature on the first run
+
   for (;;)
   {
-    uint32_t duty = fan_duty_pct;                  // copy the requested speed (0-100 %)
-    if (duty > 100) duty = 100;                    // never go above 100 %
+    float t = temperature_c;                       // latest temperature from SensorTask
+    uint32_t duty = 0;                             // default: fan off
+
+    if (t != 0.0f)                                 // 0.0 means SensorTask has no reading yet
+    {
+      if (first) { prev_t = t; first = 0; }        // avoid a huge D spike on the first sample
+
+      float error = t - TEMP_SETPOINT_C;           // positive = too warm = needs fan
+      float p = PID_KP * error;                    // P: react to how far off we are now
+
+      integral += PID_KI * error * PID_DT;         // I: slowly build up while the error stays
+      if (integral < 0.0f)   integral = 0.0f;      // anti-windup: fan can't go below 0 %...
+      if (integral > 100.0f) integral = 100.0f;    // ...or above 100 %, so don't let I grow past that
+
+      float d = PID_KD * (t - prev_t) / PID_DT;    // D: react to how fast the temperature is rising
+      prev_t = t;                                  // remember for next time
+
+      float out = p + integral + d;                // PID output in %
+      if (out < 0.0f)   out = 0.0f;                // clamp to what the fan can do
+      if (out > 100.0f) out = 100.0f;
+
+      duty = (out < FAN_MIN_DUTY) ? 0 : (uint32_t)out;  // tiny outputs = off
+    }
+    fan_duty_pct = (uint8_t)duty;                  // publish it, so the OLED can show it
+
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty * 3840 / 100);  // 3840 ticks = one full PWM period
 
     vTaskDelay(pdMS_TO_TICKS(1000));               // count tach pulses for 1 second
