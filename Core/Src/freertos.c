@@ -251,6 +251,11 @@ void FanTask(void *argument)
   float prev_t = 0.0f;                             // temperature one period ago, for the D term
   uint8_t first = 1;                               // no previous temperature on the first run
 
+  // vTaskDelayUntil counts from a reference point instead of from "now".
+  // It updates next_wake itself on every call, so the period stays exactly
+  // 1000 ms however long the body of the loop took.
+  TickType_t next_wake = xTaskGetTickCount();
+
   for (;;)
   {
     float t = temperature_c;                       // latest temperature from SensorTask
@@ -280,7 +285,7 @@ void FanTask(void *argument)
 
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty * 3840 / 100);  // 3840 ticks = one full PWM period
 
-    vTaskDelay(pdMS_TO_TICKS(1000));               // count tach pulses for 1 second
+    vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(1000)); // exactly 1 s between wake-ups
 
     taskENTER_CRITICAL();                          // block interrupts so the ISR can't change the counter mid-read
     uint32_t pulses = tach_pulses;                 // take the count...
