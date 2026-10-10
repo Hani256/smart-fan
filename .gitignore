@@ -1,3 +1,22 @@
-build
-mx.scratch
-!.settings
+# Build output
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# CubeMX and IDE internals
+mx.scratch/
+.mxproject
+.settings/
+.vscode/
+compile_commands.json
+
+# macOS
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.pyc
