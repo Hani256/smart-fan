@@ -47,6 +47,10 @@
 #define PID_DT            1.0f   // control period in seconds (FanTask runs once per second)
 #define FAN_MIN_DUTY      5      // below this the fan stops anyway, so treat it as off
 
+// How we behave when we do not have a temperature we believe in.
+#define TEMP_STALE_MS     5000   // a reading older than this is not a reading any more
+#define FAN_SAFE_DUTY     50     // what the fan runs at when it has nothing to go on
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,6 +62,10 @@
 /* USER CODE BEGIN Variables */
 volatile float temperature_c = 0; // latest temperature in C
 volatile float humidity_pct = 0;  // latest humidity in %
+
+volatile uint32_t temp_last_ms = 0; // tick of the last reading we believed
+volatile uint8_t temp_ok = 0; // 1 once the sensor has answered at least once
+volatile uint32_t temp_errors = 0; // how many times it has not, since boot
 
 volatile uint8_t  fan_duty_pct = 0;  // current fan speed, 0-100 %, set automatically from the temperature
 volatile uint32_t fan_rpm = 0;       // measured fan speed
@@ -210,25 +218,55 @@ void SensorTask(void *argument)
 
   for (;;)
   {
-    cmd[0] = 0xAC; cmd[1] = 0x33; cmd[2] = 0x00;             // the "start measurement" command
-    HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100); // send it
-    vTaskDelay(pdMS_TO_TICKS(80));                           // measuring takes ~80 ms; CPU is free meanwhile
-    HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 7, 100);   // read status + 5 data bytes + CRC
+    uint8_t ok = 0; // did this round produce a reading?
 
-    if ((rx[0] & 0x80) == 0)                                 // bit 7 = busy; 0 means the data is ready
-    {
-      uint32_t raw_h = ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | (rx[3] >> 4);   // 20-bit humidity
-      uint32_t raw_t = (((uint32_t)rx[3] & 0x0F) << 16) | ((uint32_t)rx[4] << 8) | rx[5]; // 20-bit temperature
-      humidity_pct  = raw_h * 100.0f / 1048576.0f;           // datasheet formula (1048576 = 2^20)
-      temperature_c = raw_t * 200.0f / 1048576.0f - 50.0f;   // datasheet formula
+    cmd[0] = 0xAC;
+    cmd[1] = 0x33;
+    cmd[2] = 0x00; // the "start measurement" command
+    if (HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100) == HAL_OK) {
+      vTaskDelay(
+          pdMS_TO_TICKS(80)); // measuring takes ~80 ms; CPU is free meanwhile
+      if (HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 7, 100) == HAL_OK) {
+        if ((rx[0] & 0x80) == 0) // bit 7 = busy; 0 means the data is ready
+        {
+          uint32_t raw_h =
+              ((uint32_t)rx[1] << 12) | ((uint32_t)rx[2] << 4) | (rx[3] >> 4);
+          uint32_t raw_t =
+              (((uint32_t)rx[3] & 0x0F) << 16) | ((uint32_t)rx[4] << 8) | rx[5];
+          float h =
+              raw_h * 100.0f / 1048576.0f; // datasheet formula (1048576 = 2^20)
+          float t = raw_t * 200.0f / 1048576.0f - 50.0f; // datasheet formula
+
+          // A stuck bus can hand back a byte pattern that decodes into a
+          // perfectly well formed but impossible number. Check before
+          // believing.
+          if (t > -20.0f && t < 80.0f && h >= 0.0f && h <= 100.0f) {
+            humidity_pct = h;
+            temperature_c = t;
+            temp_last_ms = HAL_GetTick(); // this is the important line
+            temp_ok = 1;
+            ok = 1;
+          }
+        }
+      }
     }
 
+    if (!ok) {
+      temp_errors++; // do not touch temperature_c. Let it go stale on its own,
+    } // and let whoever uses it notice that it did.
+
+    uint8_t temp_fresh =  (temp_ok && (HAL_GetTick() - temp_last_ms) < TEMP_STALE_MS);
     int t10 = (int)(temperature_c * 10);                     // 23.4 -> 234, so we can print without floats
     int h10 = (int)(humidity_pct * 10);                      // same for humidity
 
     ssd1306_Fill(Black);                                             // clear the drawing buffer
     ssd1306_SetCursor(0, 0);                                         // top-left corner
-    snprintf(line, sizeof(line), "T %d.%d C", t10 / 10, t10 % 10);   // e.g. "T 23.4 C"
+    if (temp_fresh)
+      snprintf(line, sizeof(line), "T %d.%d C", t10 / 10,
+              t10 % 10); // e.g. "T 23.4 C"
+    else
+      snprintf(line, sizeof(line), 
+              "T --.- C"); // say so, do not show a stale number
     ssd1306_WriteString(line, Font_11x18, White);                    // draw it into the buffer
     ssd1306_SetCursor(0, 22);                                        // second line
     snprintf(line, sizeof(line), "H %d.%d %%", h10 / 10, h10 % 10);  // e.g. "H 45.2 %"
@@ -260,8 +298,10 @@ void FanTask(void *argument)
   {
     float t = temperature_c;                       // latest temperature from SensorTask
     uint32_t duty = 0;                             // default: fan off
+    uint8_t temp_fresh =
+        (temp_ok && (HAL_GetTick() - temp_last_ms) < TEMP_STALE_MS);
 
-    if (t != 0.0f)                                 // 0.0 means SensorTask has no reading yet
+    if (temp_fresh) // 0.0 means SensorTask has no reading yet
     {
       if (first) { prev_t = t; first = 0; }        // avoid a huge D spike on the first sample
 
@@ -280,6 +320,12 @@ void FanTask(void *argument)
       if (out > 100.0f) out = 100.0f;
 
       duty = (out < FAN_MIN_DUTY) ? 0 : (uint32_t)out;  // tiny outputs = off
+    } else {
+      // No temperature we trust. Keep blowing at a fixed speed so the thing is
+      // still a fan, but do not pretend to be controlling anything.
+      duty = FAN_SAFE_DUTY;
+      integral = 0.0f; // throw away windup built on old data
+      first = 1;       // next good sample starts the D term clean
     }
     fan_duty_pct = (uint8_t)duty;                  // publish it, so the OLED can show it
 
