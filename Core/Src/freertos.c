@@ -39,13 +39,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// PID fan controller. Tune these.
-#define TEMP_SETPOINT_C  23.5f   // target temperature: above this the fan starts
-#define PID_KP           20.0f   // P: % of fan speed per degree above the setpoint
-#define PID_KI            0.5f   // I: % added per second, per degree above the setpoint
-#define PID_KD            5.0f   // D: % per (degree per second) of rising temperature
-#define PID_DT            1.0f   // control period in seconds (FanTask runs once per second)
-#define FAN_MIN_DUTY      5      // below this the fan stops anyway, so treat it as off
+// Temperature to fan speed.
+//
+// A desk fan does not cool the room, it blows air at whoever is sitting in
+// front of it, so there is no loop to close and a PID has nothing to converge
+// to. What this needs is a comfort curve: this warm means this fast. Set these
+// four numbers to what feels right to you, that is the correct way to tune
+// them.
+#define FAN_T_ON          21.0f    // start blowing at or above this
+#define FAN_T_OFF         20.0f   // and stop again only once it has dropped to here
+#define FAN_T_FULL        25.0f  // full speed at or above this
+#define FAN_DUTY_START    30 // the slowest duty at which the fan actually turns
+#define FAN_DUTY_MAX      100
+#define FAN_SLEW_PER_S    10 // the most the duty may change in one second
+#define FAN_KICK_MS       400 // full power for this long when starting from standstill
 
 // How we behave when we do not have a temperature we believe in.
 #define TEMP_STALE_MS     5000   // a reading older than this is not a reading any more
@@ -285,9 +292,8 @@ void FanTask(void *argument)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);        // start the 25 kHz PWM signal on PA8
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);      // start tach capture on PA5, interrupt on every pulse
 
-  float integral = 0.0f;                           // I term: the error summed over time, in %
-  float prev_t = 0.0f;                             // temperature one period ago, for the D term
-  uint8_t first = 1;                               // no previous temperature on the first run
+  uint8_t fan_on = 0;    // the hysteresis state: is it currently blowing?
+  uint16_t duty_now = 0; // what we are actually commanding, after slew limiting
 
   // vTaskDelayUntil counts from a reference point instead of from "now".
   // It updates next_wake itself on every call, so the period stays exactly
@@ -296,39 +302,61 @@ void FanTask(void *argument)
 
   for (;;)
   {
-    float t = temperature_c;                       // latest temperature from SensorTask
-    uint32_t duty = 0;                             // default: fan off
+    float t = temperature_c; // latest temperature from SensorTask
+    uint16_t want = 0;       // what the curve asks for, before slew limiting
+
     uint8_t temp_fresh =
         (temp_ok && (HAL_GetTick() - temp_last_ms) < TEMP_STALE_MS);
 
-    if (temp_fresh) // 0.0 means SensorTask has no reading yet
-    {
-      if (first) { prev_t = t; first = 0; }        // avoid a huge D spike on the first sample
-
-      float error = t - TEMP_SETPOINT_C;           // positive = too warm = needs fan
-      float p = PID_KP * error;                    // P: react to how far off we are now
-
-      integral += PID_KI * error * PID_DT;         // I: slowly build up while the error stays
-      if (integral < 0.0f)   integral = 0.0f;      // anti-windup: fan can't go below 0 %...
-      if (integral > 100.0f) integral = 100.0f;    // ...or above 100 %, so don't let I grow past that
-
-      float d = PID_KD * (t - prev_t) / PID_DT;    // D: react to how fast the temperature is rising
-      prev_t = t;                                  // remember for next time
-
-      float out = p + integral + d;                // PID output in %
-      if (out < 0.0f)   out = 0.0f;                // clamp to what the fan can do
-      if (out > 100.0f) out = 100.0f;
-
-      duty = (out < FAN_MIN_DUTY) ? 0 : (uint32_t)out;  // tiny outputs = off
+    if (!temp_fresh) {
+      want = FAN_SAFE_DUTY; // nothing to go on, so stop pretending to control
+      fan_on = 0;           // and make a returning sensor start the curve fresh
     } else {
-      // No temperature we trust. Keep blowing at a fixed speed so the thing is
-      // still a fan, but do not pretend to be controlling anything.
-      duty = FAN_SAFE_DUTY;
-      integral = 0.0f; // throw away windup built on old data
-      first = 1;       // next good sample starts the D term clean
+      // Hysteresis. It takes FAN_T_ON to start but only FAN_T_OFF to stop, so a
+      // temperature sitting exactly on one threshold cannot make the fan
+      // chatter.
+      if (!fan_on && t >= FAN_T_ON)
+        fan_on = 1;
+      if (fan_on && t <= FAN_T_OFF)
+        fan_on = 0;
+
+      if (!fan_on) {
+        want = 0;
+      } else if (t >= FAN_T_FULL) {
+        want = FAN_DUTY_MAX;
+      } else {
+        // Straight line between the two temperatures, starting at the lowest
+        // duty that actually turns the fan rather than at zero.
+        float frac = (t - FAN_T_ON) / (FAN_T_FULL - FAN_T_ON);
+        want =
+            FAN_DUTY_START + (uint16_t)(frac * (FAN_DUTY_MAX - FAN_DUTY_START));
+      }
     }
+
+    uint8_t starting = (duty_now == 0) && (want > 0);
+    // Slew limiting. The curve is allowed to jump, the fan is not: a sudden
+    // change in airflow is the thing a person in front of it actually notices.
+    if (want == 0) {
+      duty_now = 0; // stopping may be immediate
+    } else if (duty_now < FAN_DUTY_START) {
+      duty_now = FAN_DUTY_START; // from standstill, jump to where it turns.
+    } // Ramping through 10 and 20 only makes it buzz.
+    else if (want > duty_now) {
+      duty_now += (want - duty_now > FAN_SLEW_PER_S) ? FAN_SLEW_PER_S
+                                                     : (want - duty_now);
+    } else {
+      duty_now -= (duty_now - want > FAN_SLEW_PER_S) ? FAN_SLEW_PER_S
+                                                     : (duty_now - want);
+    }
+
+    uint32_t duty = duty_now;
     fan_duty_pct = (uint8_t)duty;                  // publish it, so the OLED can show it
 
+    if (starting) {
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 3840); // 100 %
+      vTaskDelay(pdMS_TO_TICKS(FAN_KICK_MS));
+    }
+    
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty * 3840 / 100);  // 3840 ticks = one full PWM period
 
     vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(1000)); // exactly 1 s between wake-ups
