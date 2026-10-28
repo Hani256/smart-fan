@@ -104,7 +104,7 @@ osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
     .name = "defaultTask",
     .stack_size = 128 * 4,
-    .priority = (osPriority_t)osPriorityNormal,
+    .priority = (osPriority_t)osPriorityLow,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -194,12 +194,20 @@ void MX_FREERTOS_Init(void) {
       osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // Create our task with the native FreeRTOS API.
-  // 512 = stack size in words (2 KB); priority 1 = just above the idle task.
-  xTaskCreate(SensorTask, "sensor", 512, NULL, tskIDLE_PRIORITY + 1, NULL);
-  // Fan task: small stack (256 words = 1 KB), higher priority (2) because it is
-  // timing-related.
-  xTaskCreate(FanTask, "fan", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
+  // Priorities, lowest to highest:
+  //   defaultTask (LED blink)  osPriorityLow          8
+  //   sensor                   osPriorityBelowNormal 16
+  //   fan                      osPriorityNormal      24
+  // The blink task is set in CubeMX and created with the CMSIS API, which uses
+  // these same numbers, so ours use the CMSIS names too. That keeps all three
+  // on one scale, and the LED cannot get in front of the fan.
+  //
+  // Created with the native FreeRTOS API. 512 = stack size in words (2 KB).
+  xTaskCreate(SensorTask, "sensor", 512, NULL,
+              (UBaseType_t)osPriorityBelowNormal, NULL);
+  // Fan task: small stack (256 words = 1 KB), highest of the three because it
+  // is timing-related.
+  xTaskCreate(FanTask, "fan", 256, NULL, (UBaseType_t)osPriorityNormal, NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
