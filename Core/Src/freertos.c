@@ -1,40 +1,53 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * File Name          : freertos.c
-  * Description        : Code for freertos applications
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * File Name          : freertos.c
+ * Description        : Code for freertos applications
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
-#include "task.h"
-#include "main.h"
 #include "cmsis_os.h"
+#include "main.h"
+#include "task.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>          // snprintf: builds text strings
-#include "i2c.h"            // hi2c1, the I2C1 handle CubeMX created
-#include "tim.h"            // htim1 (fan PWM) and htim2 (tach capture)
-#include "ssd1306.h"        // OLED driver
-#include "ssd1306_fonts.h"  // OLED fonts
+#include "i2c.h"           // hi2c1, the I2C1 handle CubeMX created
+#include "queue.h"         // xQueueCreate, xQueueOverwrite, xQueuePeek
+#include "ssd1306.h"       // OLED driver
+#include "ssd1306_fonts.h" // OLED fonts
+#include "tim.h"           // htim1 (fan PWM) and htim2 (tach capture)
+#include <stdio.h>         // snprintf: builds text strings
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+// One reading, together with the moment it was taken. These two belong to each
+// other, so they have to travel together or neither of them is trustworthy.
+typedef struct {
+  float temp_c;
+  float hum_pct;
+  uint32_t stamp_ms;
+} sensor_sample_t;
 
+// What the fan is doing right now, for the display.
+typedef struct {
+  uint8_t duty_pct;
+  uint32_t rpm;
+} fan_status_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -46,17 +59,19 @@
 // to. What this needs is a comfort curve: this warm means this fast. Set these
 // four numbers to what feels right to you, that is the correct way to tune
 // them.
-#define FAN_T_ON          21.0f    // start blowing at or above this
-#define FAN_T_OFF         20.0f   // and stop again only once it has dropped to here
-#define FAN_T_FULL        25.0f  // full speed at or above this
-#define FAN_DUTY_START    30 // the slowest duty at which the fan actually turns
-#define FAN_DUTY_MAX      100
-#define FAN_SLEW_PER_S    10 // the most the duty may change in one second
-#define FAN_KICK_MS       400 // full power for this long when starting from standstill
+#define FAN_T_ON 21.0f    // start blowing at or above this
+#define FAN_T_OFF 20.0f   // and stop again only once it has dropped to here
+#define FAN_T_FULL 25.0f  // full speed at or above this
+#define FAN_DUTY_START 30 // the slowest duty at which the fan actually turns
+#define FAN_DUTY_MAX 100
+#define FAN_SLEW_PER_S 10 // the most the duty may change in one second
+#define FAN_KICK_MS                                                            \
+  400 // full power for this long when starting from standstill
 
 // How we behave when we do not have a temperature we believe in.
-#define TEMP_STALE_MS     5000   // a reading older than this is not a reading any more
-#define FAN_SAFE_DUTY     50     // what the fan runs at when it has nothing to go on
+#define TEMP_STALE_MS                                                          \
+  5000                   // a reading older than this is not a reading any more
+#define FAN_SAFE_DUTY 50 // what the fan runs at when it has nothing to go on
 
 /* USER CODE END PD */
 
@@ -67,30 +82,37 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-volatile float temperature_c = 0; // latest temperature in C
-volatile float humidity_pct = 0;  // latest humidity in %
+// Two one-deep mailboxes. Each holds only the newest value: the writer
+// overwrites whatever was there, the reader peeks without taking it away.
+//
+// A shared volatile global would have been simpler and subtly wrong. Writing
+// the temperature and its timestamp is two separate stores, and the task that
+// reads them has the higher priority, so it can run in the gap between the two
+// and see a new reading carrying an old timestamp. volatile does not help with
+// that: it controls visibility and the order of volatile accesses, not whether
+// a group of them is indivisible. The queue copies the whole struct under a
+// critical section, so from any other task there is no half-written state.
+QueueHandle_t q_sensor; // SensorTask to FanTask: the temperature
+QueueHandle_t q_fan;    // FanTask to SensorTask: duty and rpm, for the screen
 
-volatile uint32_t temp_last_ms = 0; // tick of the last reading we believed
-volatile uint8_t temp_ok = 0; // 1 once the sensor has answered at least once
-volatile uint32_t temp_errors = 0; // how many times it has not, since boot
-
-volatile uint8_t  fan_duty_pct = 0;  // current fan speed, 0-100 %, set automatically from the temperature
-volatile uint32_t fan_rpm = 0;       // measured fan speed
-volatile uint32_t tach_pulses = 0;   // pulses counted by the TIM2 interrupt since the last reading
+volatile uint32_t temp_errors = 0; // SensorTask only, never crosses a task
+volatile uint32_t tach_pulses = 0; // written by the TIM2 ISR, read by FanTask
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+    .name = "defaultTask",
+    .stack_size = 128 * 4,
+    .priority = (osPriority_t)osPriorityNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-void SensorTask(void *argument);    // our own task: reads the AHT20 and draws on the OLED
-void FanTask(void *argument);       // our own task: drives the fan PWM and measures its RPM
+void SensorTask(
+    void *argument); // our own task: reads the AHT20 and draws on the OLED
+void FanTask(
+    void *argument); // our own task: drives the fan PWM and measures its RPM
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -105,47 +127,39 @@ void vApplicationMallocFailedHook(void);
 
 /* USER CODE BEGIN 1 */
 /* Functions needed when configGENERATE_RUN_TIME_STATS is on */
-__weak void configureTimerForRunTimeStats(void)
-{
+__weak void configureTimerForRunTimeStats(void) {}
 
-}
-
-__weak unsigned long getRunTimeCounterValue(void)
-{
-return 0;
-}
+__weak unsigned long getRunTimeCounterValue(void) { return 0; }
 /* USER CODE END 1 */
 
 /* USER CODE BEGIN 4 */
-void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
-{
-   /* Run time stack overflow checking is performed if
-   configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
-   called if a stack overflow is detected. */
+void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName) {
+  /* Run time stack overflow checking is performed if
+  configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
+  called if a stack overflow is detected. */
 }
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
-void vApplicationMallocFailedHook(void)
-{
-   /* vApplicationMallocFailedHook() will only be called if
-   configUSE_MALLOC_FAILED_HOOK is set to 1 in FreeRTOSConfig.h. It is a hook
-   function that will get called if a call to pvPortMalloc() fails.
-   pvPortMalloc() is called internally by the kernel whenever a task, queue,
-   timer or semaphore is created. It is also called by various parts of the
-   demo application. If heap_1.c or heap_2.c are used, then the size of the
-   heap available to pvPortMalloc() is defined by configTOTAL_HEAP_SIZE in
-   FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
-   to query the size of free heap space that remains (although it does not
-   provide information on how the remaining heap might be fragmented). */
+void vApplicationMallocFailedHook(void) {
+  /* vApplicationMallocFailedHook() will only be called if
+  configUSE_MALLOC_FAILED_HOOK is set to 1 in FreeRTOSConfig.h. It is a hook
+  function that will get called if a call to pvPortMalloc() fails.
+  pvPortMalloc() is called internally by the kernel whenever a task, queue,
+  timer or semaphore is created. It is also called by various parts of the
+  demo application. If heap_1.c or heap_2.c are used, then the size of the
+  heap available to pvPortMalloc() is defined by configTOTAL_HEAP_SIZE in
+  FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
+  to query the size of free heap space that remains (although it does not
+  provide information on how the remaining heap might be fragmented). */
 }
 /* USER CODE END 5 */
 
 /**
-  * @brief  FreeRTOS initialization
-  * @param  None
-  * @retval None
-  */
+ * @brief  FreeRTOS initialization
+ * @param  None
+ * @retval None
+ */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
@@ -164,68 +178,103 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  // Length 1 on purpose: a mailbox, not a backlog. Neither task wants a queue
+  // of old readings, both want the newest one. This runs before the tasks are
+  // created and before the scheduler starts, so the mailboxes always exist by
+  // the time anyone looks in them.
+  q_sensor = xQueueCreate(1, sizeof(sensor_sample_t));
+  q_fan = xQueueCreate(1, sizeof(fan_status_t));
+  configASSERT(q_sensor != NULL &&
+               q_fan != NULL); // NULL here means the heap is too small
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  defaultTaskHandle =
+      osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   // Create our task with the native FreeRTOS API.
   // 512 = stack size in words (2 KB); priority 1 = just above the idle task.
   xTaskCreate(SensorTask, "sensor", 512, NULL, tskIDLE_PRIORITY + 1, NULL);
-  // Fan task: small stack (256 words = 1 KB), higher priority (2) because it is timing-related.
+  // Fan task: small stack (256 words = 1 KB), higher priority (2) because it is
+  // timing-related.
   xTaskCreate(FanTask, "fan", 256, NULL, tskIDLE_PRIORITY + 2, NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
   /* add events, ... */
   /* USER CODE END RTOS_EVENTS */
-
 }
 
 /* USER CODE BEGIN Header_StartDefaultTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
+ * @brief  Function implementing the defaultTask thread.
+ * @param  argument: Not used
+ * @retval None
+ */
 /* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
-{
+void StartDefaultTask(void *argument) {
   /* USER CODE BEGIN StartDefaultTask */
-  for (;;)
-  {
+  for (;;) {
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // blink = "system is alive"
-    vTaskDelay(pdMS_TO_TICKS(500));         // sleep 500 ms, CPU free for other tasks
+    vTaskDelay(pdMS_TO_TICKS(500)); // sleep 500 ms, CPU free for other tasks
   }
   /* USER CODE END StartDefaultTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-void SensorTask(void *argument)
-{
-  uint8_t cmd[3];            // bytes we send to the sensor
-  uint8_t rx[7];             // bytes we get back
-  char line[20];             // one line of text for the screen
+// Bring I2C1 back after an error. A slave unplugged in the middle of a
+// transfer can leave the bus stuck, and once HAL has recorded that, every
+// later call keeps failing until the peripheral is rebuilt.
+static void i2c_recover(void) {
+  HAL_I2C_DeInit(&hi2c1);
+  vTaskDelay(pdMS_TO_TICKS(2));
+  MX_I2C1_Init();
+}
 
-  vTaskDelay(pdMS_TO_TICKS(40));                             // AHT20 needs 40 ms after power-up
+// Ask the AHT20 whether it is calibrated and calibrate it if not.
+// This has to be callable at any time, not only at boot: a sensor that was
+// disconnected comes back uncalibrated and answers with nonsense until it
+// gets this command again. Returns 1 if the sensor is talking to us.
+static uint8_t aht20_begin(void) {
+  uint8_t cmd[3], rx[1];
 
-  HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 1, 100);     // read the AHT20 status byte
-  if ((rx[0] & 0x08) == 0)                                   // bit 3 = calibrated? if not...
+  if (HAL_I2C_Master_Receive(&hi2c1, 0x38 << 1, rx, 1, 100) != HAL_OK)
+    return 0; // nobody there
+
+  if ((rx[0] & 0x08) == 0) // bit 3 = calibrated? if not...
   {
-    cmd[0] = 0xBE; cmd[1] = 0x08; cmd[2] = 0x00;             // ...the "initialize" command
-    HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100); // send it
-    vTaskDelay(pdMS_TO_TICKS(10));                           // give it 10 ms
+    cmd[0] = 0xBE;
+    cmd[1] = 0x08;
+    cmd[2] = 0x00; // ...the "initialize" command
+    if (HAL_I2C_Master_Transmit(&hi2c1, 0x38 << 1, cmd, 3, 100) != HAL_OK)
+      return 0;
+    vTaskDelay(pdMS_TO_TICKS(10)); // give it 10 ms
   }
+  return 1;
+}
 
-  ssd1306_Init();                                            // wake the OLED up and configure it
+void SensorTask(void *argument) {
+  uint8_t cmd[3]; // bytes we send to the sensor
+  uint8_t rx[7];  // bytes we get back
+  char line[20];  // one line of text for the screen
 
-  for (;;)
-  {
+  sensor_sample_t s = {0};  // the newest reading we have taken
+  fan_status_t f = {0};     // the newest fan status, for the bottom line
+  uint8_t have_reading = 0; // 1 once the sensor has answered at least once
+  uint8_t fails = 0; // failed rounds in a row, for deciding when to recover
+
+  vTaskDelay(pdMS_TO_TICKS(40)); // AHT20 needs 40 ms after power-up
+
+  aht20_begin(); // may fail if the sensor is absent; the loop retries
+
+  ssd1306_Init(); // wake the OLED up and configure it
+
+  for (;;) {
     uint8_t ok = 0; // did this round produce a reading?
+
 
     cmd[0] = 0xAC;
     cmd[1] = 0x33;
@@ -248,65 +297,97 @@ void SensorTask(void *argument)
           // perfectly well formed but impossible number. Check before
           // believing.
           if (t > -20.0f && t < 80.0f && h >= 0.0f && h <= 100.0f) {
-            humidity_pct = h;
-            temperature_c = t;
-            temp_last_ms = HAL_GetTick(); // this is the important line
-            temp_ok = 1;
+            s.temp_c = t;
+            s.hum_pct = h;
+            s.stamp_ms = HAL_GetTick(); // this is the important line
+            have_reading = 1;
             ok = 1;
+            // One call, one complete sample. There is no instant at which the
+            // other task can see half of it.
+            xQueueOverwrite(q_sensor, &s);
           }
         }
       }
     }
 
+    // Either way, do not touch the mailbox. Let the last sample go stale on
+    // its own, and let whoever reads it notice from the timestamp.
     if (!ok) {
-      temp_errors++; // do not touch temperature_c. Let it go stale on its own,
-    } // and let whoever uses it notice that it did.
+      temp_errors++;
+      // Three failures in a row is not bad luck, it is a broken link. Rebuild
+      // the bus, then hand the sensor its calibrate command again, because a
+      // reconnected AHT20 has forgotten it.
+      if (++fails >= 3) {
+        fails = 0;
+        i2c_recover();
+        aht20_begin();
+      }
+    } else {
+      fails = 0;
+    }
 
-    uint8_t temp_fresh =  (temp_ok && (HAL_GetTick() - temp_last_ms) < TEMP_STALE_MS);
-    int t10 = (int)(temperature_c * 10);                     // 23.4 -> 234, so we can print without floats
-    int h10 = (int)(humidity_pct * 10);                      // same for humidity
+    uint8_t temp_fresh =
+        (have_reading && (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS);
+    int t10 =
+        (int)(s.temp_c * 10); // 23.4 -> 234, so we can print without floats
+    int h10 = (int)(s.hum_pct * 10); // same for humidity
 
-    ssd1306_Fill(Black);                                             // clear the drawing buffer
-    ssd1306_SetCursor(0, 0);                                         // top-left corner
+    xQueuePeek(q_fan, &f, 0); // newest fan status, or leave f as it was
+
+    ssd1306_Fill(Black);     // clear the drawing buffer
+    ssd1306_SetCursor(0, 0); // top-left corner
     if (temp_fresh)
       snprintf(line, sizeof(line), "T %d.%d C", t10 / 10,
-              t10 % 10); // e.g. "T 23.4 C"
+               t10 % 10); // e.g. "T 23.4 C"
     else
-      snprintf(line, sizeof(line), 
-              "T --.- C"); // say so, do not show a stale number
-    ssd1306_WriteString(line, Font_11x18, White);                    // draw it into the buffer
-    ssd1306_SetCursor(0, 22);                                        // second line
-    snprintf(line, sizeof(line), "H %d.%d %%", h10 / 10, h10 % 10);  // e.g. "H 45.2 %"
-    ssd1306_WriteString(line, Font_11x18, White);                    // draw it
-    ssd1306_SetCursor(0, 44);                                        // third line
-    snprintf(line, sizeof(line), "F %lu %u%%", (unsigned long)fan_rpm, fan_duty_pct); // e.g. "F 1500 40%"
-    ssd1306_WriteString(line, Font_11x18, White);                    // draw it
-    ssd1306_UpdateScreen();                                          // send the whole buffer to the OLED
+      snprintf(line, sizeof(line),
+               "T --.- C"); // say so, do not show a stale number
+    ssd1306_WriteString(line, Font_11x18, White); // draw it into the buffer
+    ssd1306_SetCursor(0, 22);                     // second line
+    snprintf(line, sizeof(line), "H %d.%d %%", h10 / 10,
+             h10 % 10);                           // e.g. "H 45.2 %"
+    ssd1306_WriteString(line, Font_11x18, White); // draw it
+    ssd1306_SetCursor(0, 44);                     // third line
+    snprintf(line, sizeof(line), "F %lu %u%%", (unsigned long)f.rpm,
+             f.duty_pct); // e.g. "F 1500 40%"
+    ssd1306_WriteString(line, Font_11x18, White); // draw it
+    ssd1306_UpdateScreen(); // send the whole buffer to the OLED
 
-    vTaskDelay(pdMS_TO_TICKS(1000));                         // one reading per second
+    vTaskDelay(pdMS_TO_TICKS(1000)); // one reading per second
   }
 }
 
-void FanTask(void *argument)
-{
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);        // start the 25 kHz PWM signal on PA8
-  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);      // start tach capture on PA5, interrupt on every pulse
+void FanTask(void *argument) {
+  HAL_TIM_PWM_Start(&htim1,
+                    TIM_CHANNEL_1); // start the 25 kHz PWM signal on PA8
+  HAL_TIM_IC_Start_IT(
+      &htim2,
+      TIM_CHANNEL_1); // start tach capture on PA5, interrupt on every pulse
 
   uint8_t fan_on = 0;    // the hysteresis state: is it currently blowing?
   uint16_t duty_now = 0; // what we are actually commanding, after slew limiting
+
+  sensor_sample_t s;     // the latest sample we peeked out of the mailbox
+  fan_status_t st = {0}; // what we publish back for the screen
 
   // vTaskDelayUntil counts from a reference point instead of from "now".
   // It updates next_wake itself on every call, so the period stays exactly
   // 1000 ms however long the body of the loop took.
   TickType_t next_wake = xTaskGetTickCount();
 
-  for (;;)
-  {
-    float t = temperature_c; // latest temperature from SensorTask
-    uint16_t want = 0;       // what the curve asks for, before slew limiting
+  for (;;) {
+    uint16_t want = 0; // what the curve asks for, before slew limiting
 
-    uint8_t temp_fresh =
-        (temp_ok && (HAL_GetTick() - temp_last_ms) < TEMP_STALE_MS);
+    // Peek, not receive: the sample stays in the mailbox, so a round in which
+    // the sensor said nothing still sees the last thing it did say. The
+    // timestamp inside the sample is what decides whether that is still worth
+    // anything, and it arrived together with the value it belongs to.
+    float t = 0.0f;
+    uint8_t temp_fresh = 0;
+    if (xQueuePeek(q_sensor, &s, 0) == pdTRUE) {
+      t = s.temp_c;
+      temp_fresh = (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS;
+    }
 
     if (!temp_fresh) {
       want = FAN_SAFE_DUTY; // nothing to go on, so stop pretending to control
@@ -350,33 +431,40 @@ void FanTask(void *argument)
     }
 
     uint32_t duty = duty_now;
-    fan_duty_pct = (uint8_t)duty;                  // publish it, so the OLED can show it
+    st.duty_pct = (uint8_t)duty;
+    xQueueOverwrite(q_fan, &st); // publish it, so the OLED can show it
 
     if (starting) {
       __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 3840); // 100 %
       vTaskDelay(pdMS_TO_TICKS(FAN_KICK_MS));
     }
-    
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty * 3840 / 100);  // 3840 ticks = one full PWM period
 
-    vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(1000)); // exactly 1 s between wake-ups
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1,
+                          duty * 3840 /
+                              100); // 3840 ticks = one full PWM period
 
-    taskENTER_CRITICAL();                          // block interrupts so the ISR can't change the counter mid-read
-    uint32_t pulses = tach_pulses;                 // take the count...
-    tach_pulses = 0;                               // ...and reset it for the next second
-    taskEXIT_CRITICAL();                           // interrupts back on
+    vTaskDelayUntil(&next_wake,
+                    pdMS_TO_TICKS(1000)); // exactly 1 s between wake-ups
 
-    fan_rpm = pulses * 30;                         // fan gives 2 pulses per turn: pulses/2 per second x 60 s
+    taskENTER_CRITICAL(); // block interrupts so the ISR can't change the
+                          // counter mid-read
+    uint32_t pulses = tach_pulses; // take the count...
+    tach_pulses = 0;               // ...and reset it for the next second
+    taskEXIT_CRITICAL();           // interrupts back on
+
+    st.rpm =
+        pulses * 30; // fan gives 2 pulses per turn: pulses/2 per second x 60 s
+    xQueueOverwrite(q_fan, &st); // publish the speed too
   }
 }
 
-// HAL calls this from the TIM2 interrupt every time the tach pin sees a rising edge.
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-  if (htim->Instance == TIM2)                      // this callback is shared by all timers, so check which one
+// HAL calls this from the TIM2 interrupt every time the tach pin sees a rising
+// edge.
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance ==
+      TIM2) // this callback is shared by all timers, so check which one
   {
-    tach_pulses++;                                 // just count; keep interrupt code as short as possible
+    tach_pulses++; // just count; keep interrupt code as short as possible
   }
 }
 /* USER CODE END Application */
-
