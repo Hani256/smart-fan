@@ -55,12 +55,13 @@ by how it feels, and they are all at the top of `freertos.c`.
 | ESP32 link | USART2 on PA2 (TX) and PA3 (RX), with DMA (not used by the firmware yet) |
 | RTOS | FreeRTOS through CMSIS-RTOS v2 |
 
-The fan is an ARCTIC P12 PWM, a 4 pin fan that runs from 12 V all the time and
+The fan is an ARCTIC P12 Pro, a 4 pin fan that runs from 12 V all the time and
 takes its speed from the PWM wire. A PN2222A transistor pulls that wire low,
 driven from PA8 through a base resistor. The transistor inverts the signal, so
 the timer channel is set to active low and the duty in the code still means
 what it says. The tach wire is open collector and is pulled up to 3.3 V by the
-internal pull-up on PA5.
+internal pull-up on PA5. At 100 % duty it reads about 3000 rpm, which is the
+P12 Pro's rated top speed, so the count is right.
 
 Everything sits on a single sided board printed in PLA, with copper tape on
 raised ridges as the tracks. A 12 V jack feeds the fan directly and a 5 V

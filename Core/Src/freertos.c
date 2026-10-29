@@ -74,8 +74,9 @@ typedef struct {
 #define FAN_SAFE_DUTY 50 // what the fan runs at when it has nothing to go on
 
 // Tach edges closer together than this are noise, not the fan. Two pulses per
-// turn, so 5000 us between them would be 6000 rpm, more than three times what
-// this fan can do. A real pulse train never comes this close.
+// turn, so 5000 us between them would be 6000 rpm, twice the 3000 rpm this
+// fan (an ARCTIC P12 Pro) is rated for. A real pulse train never comes this
+// close.
 #define TACH_MIN_GAP_US 5000
 
 /* USER CODE END PD */
