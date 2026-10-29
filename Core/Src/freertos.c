@@ -30,6 +30,7 @@
 #include "ssd1306.h"       // OLED driver
 #include "ssd1306_fonts.h" // OLED fonts
 #include "tim.h"           // htim1 (fan PWM) and htim2 (tach capture)
+#include "usart.h"         // huart2, the serial link to the ESP32
 #include <stdio.h>         // snprintf: builds text strings
 /* USER CODE END Includes */
 
@@ -78,6 +79,8 @@ typedef struct {
 // fan (an ARCTIC P12 Pro) is rated for. A real pulse train never comes this
 // close.
 #define TACH_MIN_GAP_US 5000
+// The status line to the ESP32 goes out this often.
+#define LINK_PERIOD_MS 1000
 
 /* USER CODE END PD */
 
@@ -103,6 +106,7 @@ QueueHandle_t q_fan;    // FanTask to SensorTask: duty and rpm, for the screen
 
 volatile uint32_t temp_errors = 0; // SensorTask only, never crosses a task
 volatile uint32_t tach_pulses = 0; // written by the TIM2 ISR, read by FanTask
+static TaskHandle_t link_task;     // The UART transmit-complete interrupt wakes this task, so it needs the handle.
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
@@ -119,6 +123,8 @@ void SensorTask(
     void *argument); // our own task: reads the AHT20 and draws on the OLED
 void FanTask(
     void *argument); // our own task: drives the fan PWM and measures its RPM
+void LinkTask(
+    void *argument); // our own task: sends the status to the ESP32 over USART2Variables
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -202,6 +208,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_THREADS */
   // Priorities, lowest to highest:
   //   defaultTask (LED blink)  osPriorityLow          8
+  //   link to the ESP32        osPriorityLow4        12
   //   sensor                   osPriorityBelowNormal 16
   //   fan                      osPriorityNormal      24
   // The blink task is set in CubeMX and created with the CMSIS API, which uses
@@ -214,6 +221,10 @@ void MX_FREERTOS_Init(void) {
   // Fan task: small stack (256 words = 1 KB), highest of the three because it
   // is timing-related.
   xTaskCreate(FanTask, "fan", 256, NULL, (UBaseType_t)osPriorityNormal, NULL);
+  // Link task: 384 words (1.5 KB), because snprintf needs room. Below the
+  // sensor and the fan: if the ESP32 misses a line, nothing bad happens.
+  xTaskCreate(LinkTask, "link", 384, NULL, (UBaseType_t)osPriorityLow4,
+              &link_task);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -492,6 +503,55 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
       last_us = now_us;
       tach_pulses++; // keep interrupt code as short as possible
     }
+  }
+}
+// XOR of n characters. Both sides compute it, so a damaged line is caught.
+static uint8_t link_checksum(const char *p, int n) {
+  uint8_t x = 0;
+  while (n--)
+    x ^= (uint8_t)*p++;
+  return x;
+}
+void LinkTask(void *argument) {
+  static char buf[48]; // the line we send, must outlive the DMA transfer
+
+  TickType_t next_wake = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(LINK_PERIOD_MS));
+
+    sensor_sample_t s;
+    uint8_t fresh = 0;
+    if (xQueuePeek(q_sensor, &s, 0) == pdTRUE)
+      fresh = (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS;
+
+    fan_status_t f = {0};
+    xQueuePeek(q_fan, &f, 0);
+
+    int n;
+    if (fresh)
+      n = snprintf(buf, sizeof(buf), "$S,%d,%d,%u,%lu", (int)(s.temp_c * 10),
+                   (int)(s.hum_pct * 10), f.duty_pct, (unsigned long)f.rpm);
+    else
+      n = snprintf(buf, sizeof(buf), "$S,,,%u,%lu", f.duty_pct,
+                   (unsigned long)f.rpm);
+
+    // checksum of everything after '$', then end the line
+    n += snprintf(buf + n, sizeof(buf) - n, "*%02X\r\n",
+                  link_checksum(buf + 1, n - 1));
+
+    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)buf, n) == HAL_OK) {
+      if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0)
+        HAL_UART_AbortTransmit(&huart2); // took far too long, give up
+    }
+  }
+}
+// HAL calls this when the last byte has gone out.
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART2) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(link_task, &woken); // wake LinkTask
+    portYIELD_FROM_ISR(woken);
   }
 }
 /* USER CODE END Application */
