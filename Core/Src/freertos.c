@@ -73,6 +73,11 @@ typedef struct {
   5000                   // a reading older than this is not a reading any more
 #define FAN_SAFE_DUTY 50 // what the fan runs at when it has nothing to go on
 
+// Tach edges closer together than this are noise, not the fan. Two pulses per
+// turn, so 5000 us between them would be 6000 rpm, more than three times what
+// this fan can do. A real pulse train never comes this close.
+#define TACH_MIN_GAP_US 5000
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -468,11 +473,24 @@ void FanTask(void *argument) {
 
 // HAL calls this from the TIM2 interrupt every time the tach pin sees a rising
 // edge.
+//
+// The tach line is filtered twice. In hardware, TIM2's input filter only
+// passes a level that has been stable for about 11 us, which removes the short
+// spikes the 25 kHz PWM couples onto it. Here, an edge only counts if it comes
+// at least TACH_MIN_GAP_US after the last one that counted, which removes
+// anything slower that got through.
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance ==
       TIM2) // this callback is shared by all timers, so check which one
   {
-    tach_pulses++; // just count; keep interrupt code as short as possible
+    static uint32_t last_us = 0; // capture time of the last edge we counted
+    // TIM2 runs at 1 MHz, so the captured value is a time in microseconds.
+    uint32_t now_us = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+    // Unsigned subtraction stays correct when the 32 bit counter wraps.
+    if (now_us - last_us >= TACH_MIN_GAP_US) {
+      last_us = now_us;
+      tach_pulses++; // keep interrupt code as short as possible
+    }
   }
 }
 /* USER CODE END Application */
