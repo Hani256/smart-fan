@@ -47,12 +47,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Lib/ssd1306/ssd1306.c
     Lib/ssd1306/ssd1306_fonts.c
+    App/fan_control.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Lib/ssd1306
+    App
 )
 
 # Add project symbols (macros)

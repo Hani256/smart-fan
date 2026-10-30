@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "i2c.h"           // hi2c1, the I2C1 handle CubeMX created
+#include "fan_control.h"  // the fan logic: curve, hysteresis, slew, modes
 #include "queue.h"         // xQueueCreate, xQueueOverwrite, xQueuePeek
 #include "ssd1306.h"       // OLED driver
 #include "ssd1306_fonts.h" // OLED fonts
@@ -46,14 +47,6 @@ typedef struct {
   uint32_t stamp_ms;
 } sensor_sample_t;
 
-// What the fan should do. Changed by the button, and later from the phone.
-typedef enum {
-  MODE_AUTO = 0, // follow the temperature curve
-  MODE_MANUAL,   // fixed speed
-  MODE_OFF,      // stopped
-  MODE_NEXT,     // only in commands: "go to the next mode" (the button)
-} fan_mode_t;
-
 // One request to change the mode. Travels through q_cmd to FanTask.
 typedef struct {
   fan_mode_t mode;
@@ -70,25 +63,11 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// Temperature to fan speed.
-//
-// A desk fan does not cool the room, it blows air at whoever is sitting in
-// front of it, so there is no loop to close and a PID has nothing to converge
-// to. What this needs is a comfort curve: this warm means this fast. Set these
-// four numbers to what feels right to you, that is the correct way to tune
-// them.
-#define FAN_T_ON            21.0f    // start blowing at or above this
-#define FAN_T_OFF           20.0f   // and stop again only once it has dropped to here
-#define FAN_T_FULL          25.0f  // full speed at or above this
-#define FAN_DUTY_START      30 // the slowest duty at which the fan actually turns
-#define FAN_DUTY_MAX        100
-#define FAN_SLEW_PER_S      10 // the most the duty may change in one second
+// The fan logic and its tuning numbers live in App/fan_control.h.
 #define FAN_KICK_MS         400 // full power for this long when starting from standstill
 
 // How we behave when we do not have a temperature we believe in.
-#define TEMP_STALE_MS       5000                   // a reading older than this is not a reading any more
-#define FAN_SAFE_DUTY       50 // what the fan runs at when it has nothing to go on
-#define MANUAL_DUTY_DEFAULT 50 // manual speed until someone picks another
+#define TEMP_STALE_MS       5000 // a reading older than this is not a reading any more
 #define BUTTON_SETTLE_MS    30    // how long a contact may bounce
 
 // Tach edges closer together than this are noise, not the fan. Two pulses per
@@ -429,11 +408,10 @@ void FanTask(void *argument) {
       &htim2,
       TIM_CHANNEL_1); // start tach capture on PA5, interrupt on every pulse
 
-  uint8_t fan_on = 0;    // the hysteresis state: is it currently blowing?
-  uint16_t duty_now = 0; // what we are actually commanding, after slew limiting
-
-  fan_mode_t mode = MODE_AUTO; // start in automatic
-  uint8_t manual_duty = MANUAL_DUTY_DEFAULT;
+  // All the deciding happens in fan_control.c. This task only feeds it the
+  // commands and the temperature, and puts its answer on the PWM pin.
+  fan_ctrl_t ctrl;
+  fan_ctrl_init(&ctrl);
 
   sensor_sample_t s;     // the latest sample we peeked out of the mailbox
   fan_status_t st = {0}; // what we publish back for the screen
@@ -444,19 +422,10 @@ void FanTask(void *argument) {
   TickType_t next_wake = xTaskGetTickCount();
 
   for (;;) {
-    uint16_t want = 0; // what the curve asks for, before slew limiting
-
     // Take every command that arrived since the last round.
     fan_cmd_t c;
-    while (xQueueReceive(q_cmd, &c, 0) == pdTRUE) {
-      if (c.mode == MODE_NEXT) {
-        mode = (mode == MODE_OFF) ? MODE_AUTO : (fan_mode_t)(mode + 1);
-      } else {
-        mode = c.mode;
-        if (mode == MODE_MANUAL)
-          manual_duty = c.duty_pct;
-      }
-    }
+    while (xQueueReceive(q_cmd, &c, 0) == pdTRUE)
+      fan_ctrl_command(&ctrl, c.mode, c.duty_pct);
 
     // Peek, not receive: the sample stays in the mailbox, so a round in which
     // the sensor said nothing still sees the last thing it did say. The
@@ -469,60 +438,14 @@ void FanTask(void *argument) {
       temp_fresh = (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS;
     }
 
-    if (mode == MODE_OFF) {
-      want = 0;
-      fan_on = 0; // back in auto, the curve starts fresh
-    } else if (mode == MODE_MANUAL) {
-      want = manual_duty;
-      fan_on = 0;
-    } else if (!temp_fresh) {
-      want = FAN_SAFE_DUTY; // nothing to go on, so stop pretending to control
-      fan_on = 0;           // and make a returning sensor start the curve fresh
-    } else {
-      // Hysteresis. It takes FAN_T_ON to start but only FAN_T_OFF to stop, so a
-      // temperature sitting exactly on one threshold cannot make the fan
-      // chatter.
-      if (!fan_on && t >= FAN_T_ON)
-        fan_on = 1;
-      if (fan_on && t <= FAN_T_OFF)
-        fan_on = 0;
+    uint8_t kick;
+    uint32_t duty = fan_ctrl_step(&ctrl, temp_fresh, t, &kick);
 
-      if (!fan_on) {
-        want = 0;
-      } else if (t >= FAN_T_FULL) {
-        want = FAN_DUTY_MAX;
-      } else {
-        // Straight line between the two temperatures, starting at the lowest
-        // duty that actually turns the fan rather than at zero.
-        float frac = (t - FAN_T_ON) / (FAN_T_FULL - FAN_T_ON);
-        want =
-            FAN_DUTY_START + (uint16_t)(frac * (FAN_DUTY_MAX - FAN_DUTY_START));
-      }
-    }
-
-    uint8_t starting = (duty_now == 0) && (want > 0);
-    // Slew limiting. The curve is allowed to jump, the fan is not: a sudden
-    // change in airflow is the thing a person in front of it actually notices.
-    if (want == 0) {
-      duty_now = 0; // stopping may be immediate
-    } else if (duty_now < FAN_DUTY_START) {
-      duty_now = FAN_DUTY_START; // from standstill, jump to where it turns.
-    } // Ramping through 10 and 20 only makes it buzz.
-    else if (want > duty_now) {
-      duty_now += (want - duty_now > FAN_SLEW_PER_S) ? FAN_SLEW_PER_S
-                                                     : (want - duty_now);
-    } else {
-      duty_now -= (duty_now - want > FAN_SLEW_PER_S) ? FAN_SLEW_PER_S
-                                                     : (duty_now - want);
-    }
-
-    uint32_t duty = duty_now;
-    st.mode = mode;
+    st.mode = ctrl.mode;
     st.duty_pct = (uint8_t)duty;
-
     xQueueOverwrite(q_fan, &st); // publish it, so the OLED can show it
 
-    if (starting) {
+    if (kick) {
       __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 3840); // 100 %
       vTaskDelay(pdMS_TO_TICKS(FAN_KICK_MS));
     }
