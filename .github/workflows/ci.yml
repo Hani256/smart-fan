@@ -1,0 +1,53 @@
+# Runs on every push and pull request. Three jobs, side by side:
+# the unit tests, the STM32 firmware build and the ESP32 firmware build.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S tests -B build/tests
+      - name: Build
+        run: cmake --build build/tests
+      - name: Run
+        run: ctest --test-dir build/tests --output-on-failure
+
+  stm32-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the ARM toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi ninja-build
+      - name: Build
+        run: |
+          cmake --preset Debug
+          cmake --build build/Debug
+      - name: Size
+        run: arm-none-eabi-size build/Debug/smart_fan.elf
+
+  esp32-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('esp32/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Placeholder secrets
+        # The real ones are not in git. The examples are enough to compile.
+        run: |
+          cp esp32/src/secrets.example.h esp32/src/secrets.h
+          cp esp32/secrets.example.ini esp32/secrets.ini
+      - name: Build
+        run: pio run -d esp32 -e esp32dev
