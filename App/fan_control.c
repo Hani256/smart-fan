@@ -54,6 +54,12 @@ uint8_t fan_ctrl_step(fan_ctrl_t *c, uint8_t temp_fresh, float temp_c,
                       uint8_t *kick) {
   uint8_t want = wanted_duty(c, temp_fresh, temp_c);
 
+  // Below FAN_DUTY_START the fan cannot turn reliably, and the slew limit
+  // would bounce between that and the request every second. So any speed
+  // between 0 and FAN_DUTY_START means FAN_DUTY_START.
+  if (want > 0 && want < FAN_DUTY_START)
+    want = FAN_DUTY_START;
+
   *kick = (c->duty_now == 0) && (want > 0);
 
   // Slew limiting. The curve is allowed to jump, the fan is not: a sudden

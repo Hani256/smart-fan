@@ -1,5 +1,6 @@
 #include "link_proto.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,7 +30,10 @@ int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
 
 int link_parse_command(const char *s, fan_mode_t *mode, uint8_t *duty_pct) {
   const char *star = strchr(s, '*');
-  if (s[0] != '$' || star == NULL || strlen(star) < 3)
+  // The checksum must be exactly two hex digits and nothing after them.
+  // sscanf alone would also take " 6", because %x skips spaces.
+  if (s[0] != '$' || star == NULL || strlen(star) != 3 ||
+      !isxdigit((unsigned char)star[1]) || !isxdigit((unsigned char)star[2]))
     return 0;
   unsigned sent;
   if (sscanf(star + 1, "%2x", &sent) != 1 ||
