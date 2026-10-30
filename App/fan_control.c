@@ -44,6 +44,14 @@ static uint8_t wanted_duty(fan_ctrl_t *c, uint8_t temp_fresh, float t) {
   if (t >= FAN_T_FULL)
     return FAN_DUTY_MAX;
 
+  // Between FAN_T_OFF and FAN_T_ON the fan only runs because the hysteresis
+  // kept it on, and the curve below only starts at FAN_T_ON. So here it stays
+  // at the start speed. Working the curve out anyway would give a negative
+  // number, and turning a negative float into a uint8_t is undefined
+  // behaviour, not just a wrong value.
+  if (t < FAN_T_ON)
+    return FAN_DUTY_START;
+
   // Straight line between the two temperatures, starting at the lowest duty
   // that actually turns the fan rather than at zero.
   float frac = (t - FAN_T_ON) / (FAN_T_FULL - FAN_T_ON);

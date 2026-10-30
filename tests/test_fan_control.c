@@ -110,6 +110,29 @@ void test_manual_speed_below_the_start_speed_settles(void) {
   TEST_ASSERT_EQUAL_UINT8(a, b);
 }
 
+void test_cooling_into_the_hysteresis_band_holds_the_start_speed(void) {
+  settle(24.0f); // running well above FAN_T_ON
+  // Below FAN_T_ON but above FAN_T_OFF: still on, and settling at the start
+  // speed rather than following the curve below its own starting point.
+  TEST_ASSERT_EQUAL_UINT8(FAN_DUTY_START, settle(20.5f));
+}
+
+void test_the_band_edges_behave_as_documented(void) {
+  settle(24.0f);
+  TEST_ASSERT_EQUAL_UINT8(FAN_DUTY_START, settle(FAN_T_ON)); // curve starts here
+  TEST_ASSERT_EQUAL_UINT8(FAN_DUTY_START, step(FAN_T_ON - 0.01f));
+  TEST_ASSERT_EQUAL_UINT8(FAN_DUTY_START, step(FAN_T_OFF + 0.01f));
+  TEST_ASSERT_EQUAL_UINT8(0, step(FAN_T_OFF)); // and stops at once at FAN_T_OFF
+}
+
+void test_wandering_inside_the_band_keeps_a_steady_speed(void) {
+  float t[] = {20.9f, 20.2f, 20.99f, 20.01f, 20.5f, 20.7f, 20.3f, 20.95f};
+  settle(FAN_T_ON);
+  for (int round = 0; round < 3; round++)
+    for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+      TEST_ASSERT_EQUAL_UINT8(FAN_DUTY_START, step(t[i]));
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_starts_in_auto_with_the_fan_stopped);
@@ -125,5 +148,8 @@ int main(void) {
   RUN_TEST(test_the_button_goes_auto_manual_off_and_round_again);
   RUN_TEST(test_the_button_keeps_the_last_manual_speed);
   RUN_TEST(test_manual_speed_below_the_start_speed_settles);
+  RUN_TEST(test_cooling_into_the_hysteresis_band_holds_the_start_speed);
+  RUN_TEST(test_the_band_edges_behave_as_documented);
+  RUN_TEST(test_wandering_inside_the_band_keeps_a_steady_speed);
   return UNITY_END();
 }
