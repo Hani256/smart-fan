@@ -1,5 +1,5 @@
-# Runs on every push and pull request. Three jobs, side by side:
-# the unit tests, the STM32 firmware build and the ESP32 firmware build.
+# Runs on every push and pull request. Four jobs, side by side: the unit
+# tests, the same tests under sanitizers, and both firmware builds.
 name: CI
 
 on:
@@ -17,6 +17,19 @@ jobs:
         run: cmake --build build/tests
       - name: Run
         run: ctest --test-dir build/tests --output-on-failure
+
+  unit-tests-sanitized:
+    # The same tests with AddressSanitizer and UndefinedBehaviorSanitizer.
+    # Only the test programs get these flags, never the firmware.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S tests -B build/tests-san -DSANITIZE=ON
+      - name: Build
+        run: cmake --build build/tests-san
+      - name: Run
+        run: ctest --test-dir build/tests-san --output-on-failure
 
   stm32-firmware:
     runs-on: ubuntu-latest
