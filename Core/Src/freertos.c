@@ -25,8 +25,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "fan_control.h"   // the fan logic: curve, hysteresis, slew, modes
 #include "i2c.h"           // hi2c1, the I2C1 handle CubeMX created
-#include "fan_control.h"  // the fan logic: curve, hysteresis, slew, modes
+#include "link_proto.h"    // the lines of text to and from the ESP32
 #include "queue.h"         // xQueueCreate, xQueueOverwrite, xQueuePeek
 #include "ssd1306.h"       // OLED driver
 #include "ssd1306_fonts.h" // OLED fonts
@@ -34,7 +35,6 @@
 #include "tim.h"           // htim1 (fan PWM) and htim2 (tach capture)
 #include "usart.h"         // huart2, the serial link to the ESP32
 #include <stdio.h>         // snprintf: builds text strings
-#include <string.h>        // strchr, strncmp: reading commands
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -110,9 +110,9 @@ static TaskHandle_t button_task;   // the EXTI0 interrupt wakes this task
 // in circles. The UART callback copies whatever is new into the stream buffer,
 // and LinkRxTask reads it from there.
 static uint8_t link_rx_dma[LINK_RX_DMA_SIZE];
-static uint16_t link_rx_pos = 0;     // how far into link_rx_dma we have copied
-static StreamBufferHandle_t link_rx; // UART interrupt to LinkRxTask
-volatile uint32_t link_rx_bad = 0; // commands with a wrong checksum, for the debugger
+static uint16_t link_rx_pos = 0;      // how far into link_rx_dma we have copied
+static StreamBufferHandle_t link_rx;  // UART interrupt to LinkRxTask
+volatile uint32_t link_rx_bad = 0;    // commands thrown away (damaged or unknown), for the debugger
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
@@ -491,13 +491,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     }
   }
 }
-// XOR of n characters. Both sides compute it, so a damaged line is caught.
-static uint8_t link_checksum(const char *p, int n) {
-  uint8_t x = 0;
-  while (n--)
-    x ^= (uint8_t)*p++;
-  return x;
-}
+
 void LinkTask(void *argument) {
   static char buf[48]; // the line we send, must outlive the DMA transfer
 
@@ -514,18 +508,8 @@ void LinkTask(void *argument) {
     fan_status_t f = {0};
     xQueuePeek(q_fan, &f, 0);
 
-    int n;
-    if (fresh)
-      n = snprintf(buf, sizeof(buf), "$S,%d,%d,%u,%lu,%c", (int)(s.temp_c * 10),
-                   (int)(s.hum_pct * 10), f.duty_pct, (unsigned long)f.rpm,
-                   "AMO"[f.mode]);
-    else
-      n = snprintf(buf, sizeof(buf), "$S,,,%u,%lu,%c", f.duty_pct,
-                   (unsigned long)f.rpm, "AMO"[f.mode]);
-
-    // checksum of everything after '$', then end the line
-    n += snprintf(buf + n, sizeof(buf) - n, "*%02X\r\n",
-                  link_checksum(buf + 1, n - 1));
+        int n = link_format_status(buf, sizeof(buf), fresh, s.temp_c, s.hum_pct,
+                              f.duty_pct, f.rpm, f.mode);
 
     if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)buf, n) == HAL_OK) {
       if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0)
@@ -572,37 +556,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   }
 }
 
-// A command from the ESP32, one of:
-//
-//   $M,A*hh       automatic
-//   $M,O*hh       off
-//   $M,M,60*hh    manual, at 60 %
-//
-// Same checksum as the status line. Anything damaged or unknown is ignored.
+// One line from the ESP32. link_proto.c decides whether it is a valid command.
 static void link_handle_command(const char *s) {
-  const char *star = strchr(s, '*');
-  if (s[0] != '$' || star == NULL || strlen(star) < 3)
-    return;
-  unsigned sent;
-  if (sscanf(star + 1, "%2x", &sent) != 1 ||
-      link_checksum(s + 1, star - s - 1) != sent) {
-    link_rx_bad++;
-    return;
-  }
-
   fan_cmd_t c = {0};
-  unsigned duty;
-  if (strncmp(s, "$M,A*", 5) == 0)
-    c.mode = MODE_AUTO;
-  else if (strncmp(s, "$M,O*", 5) == 0)
-    c.mode = MODE_OFF;
-  else if (sscanf(s, "$M,M,%u*", &duty) == 1 && duty <= 100) {
-    c.mode = MODE_MANUAL;
-    c.duty_pct = (uint8_t)duty;
-  } else
-    return;
-
-  xQueueSend(q_cmd, &c, 0); // the same queue the button uses
+  if (link_parse_command(s, &c.mode, &c.duty_pct))
+    xQueueSend(q_cmd, &c, 0); // the same queue the button uses
+  else
+    link_rx_bad++;
 }
 
 // Collects bytes from the stream buffer into lines, like the ESP32 does.

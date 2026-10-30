@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Lib/ssd1306/ssd1306.c
     Lib/ssd1306/ssd1306_fonts.c
     App/fan_control.c
+    App/link_proto.c
 )
 
 # Add include paths
