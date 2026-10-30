@@ -500,7 +500,10 @@ void LinkTask(void *argument) {
   for (;;) {
     vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(LINK_PERIOD_MS));
 
-    sensor_sample_t s;
+    // Zeroed, so that before the sensor has ever answered (empty mailbox)
+    // nothing undefined goes into link_format_status. fresh stays 0 then, and
+    // the line goes out in its stale form, "$S,,,...".
+    sensor_sample_t s = {0};
     uint8_t fresh = 0;
     if (xQueuePeek(q_sensor, &s, 0) == pdTRUE)
       fresh = (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS;
