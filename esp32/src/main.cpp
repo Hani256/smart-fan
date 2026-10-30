@@ -24,6 +24,7 @@ struct Status {
   float temp_c = 0, hum_pct = 0;
   unsigned duty = 0;
   unsigned long rpm = 0;
+  char mode = 'A'; // A, M or O, as the STM32 reports it
 };
 static Status st;
 
@@ -59,17 +60,20 @@ static void handle_line(const char *s) {
   int t10, h10;
   unsigned duty;
   unsigned long rpm;
+  char mode;
 
-  if (sscanf(s, "$S,%d,%d,%u,%lu", &t10, &h10, &duty, &rpm) == 4) {
+  if (sscanf(s, "$S,%d,%d,%u,%lu,%c", &t10, &h10, &duty, &rpm, &mode) == 5) {
     st.fresh = true;
     st.temp_c = t10 / 10.0f;
     st.hum_pct = h10 / 10.0f;
     st.duty = duty;
     st.rpm = rpm;
-  } else if (sscanf(s, "$S,,,%u,%lu", &duty, &rpm) == 2) {
+    st.mode = mode;
+  } else if (sscanf(s, "$S,,,%u,%lu,%c", &duty, &rpm, &mode) == 3) {
     st.fresh = false; // the STM32 says its reading is stale
     st.duty = duty;
     st.rpm = rpm;
+    st.mode = mode;
   } else {
     Serial.printf("did not understand: %s\n", s);
   }
@@ -78,14 +82,42 @@ static void handle_line(const char *s) {
 static void send_page() { server.send(200, "text/html", PAGE); }
 
 static void send_status() {
-  char json[160];
+  char json[192];
   snprintf(json, sizeof(json),
            "{\"fresh\":%s,\"t\":%.1f,\"h\":%.1f,\"duty\":%u,\"rpm\":%lu,"
-           "\"age_ms\":%lu,\"ok\":%lu,\"bad\":%lu}",
+           "\"mode\":\"%c\",\"age_ms\":%lu,\"ok\":%lu,\"bad\":%lu}",
            st.fresh ? "true" : "false", st.temp_c, st.hum_pct, st.duty, st.rpm,
-           (unsigned long)(millis() - last_line_ms), (unsigned long)good,
-           (unsigned long)bad);
+           st.mode, (unsigned long)(millis() - last_line_ms),
+           (unsigned long)good, (unsigned long)bad);
   server.send(200, "application/json", json);
+}
+
+// The page asks for a new mode with POST /mode?m=A, ?m=O or ?m=M&duty=60.
+// Turn that into a command line for the STM32, with the same checksum.
+static void set_mode() {
+  String m = server.arg("m");
+  char cmd[16];
+  if (m == "A") {
+    snprintf(cmd, sizeof(cmd), "$M,A");
+  } else if (m == "O") {
+    snprintf(cmd, sizeof(cmd), "$M,O");
+  } else if (m == "M") {
+    long duty = server.arg("duty").toInt();
+    if (duty < 0 || duty > 100) {
+      server.send(400, "text/plain", "duty must be 0 to 100");
+      return;
+    }
+    snprintf(cmd, sizeof(cmd), "$M,M,%ld", duty);
+  } else {
+    server.send(400, "text/plain", "m must be A, M or O");
+    return;
+  }
+
+  uint8_t x = 0;
+  for (const char *p = cmd + 1; *p; p++) // everything after the '$'
+    x ^= (uint8_t)*p;
+  Serial2.printf("%s*%02X\r\n", cmd, x);
+  server.send(200, "text/plain", "ok");
 }
 
 static bool online = false;      // web server and OTA are running
@@ -106,6 +138,7 @@ static void wifi_poll() {
     if (!online) {
       server.on("/", send_page);
       server.on("/status.json", send_status);
+      server.on("/mode", HTTP_POST, set_mode);
       server.begin();
       ArduinoOTA.setHostname("smartfan"); // also makes smartfan.local work
       ArduinoOTA.setPassword(OTA_PASS);

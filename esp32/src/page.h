@@ -45,6 +45,15 @@ transition:width .6s ease}
 footer{margin-top:18px;font-size:13px;color:var(--muted);text-align:center;
 font-variant-numeric:tabular-nums}
 .stale .value{color:var(--muted)}
+.wide{grid-column:1/-1;min-height:0}
+.seg{display:flex;gap:6px;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:4px}
+.seg button{flex:1;font:inherit;font-weight:600;color:var(--muted);background:none;border:0;
+border-radius:9px;padding:10px 0;cursor:pointer}
+.seg button.on{background:var(--card);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.slider{display:flex;align-items:center;gap:14px;margin-top:14px}
+.slider input{flex:1;accent-color:var(--fan);height:28px}
+.slider span{min-width:48px;text-align:right;font-variant-numeric:tabular-nums}
+.slider.off{opacity:.45}
 </style></head><body><main>
 <header><h1>Smart fan</h1>
 <div class="pill" id="pill"><span class="dot"></span><span id="state">Connecting</span></div>
@@ -76,11 +85,40 @@ font-variant-numeric:tabular-nums}
   </div>
   <div class="bar"><i id="db"></i></div>
  </section>
+ <section class="card wide">
+  <div class="label">Mode</div>
+  <div class="seg" id="seg">
+   <button data-m="A">Auto</button><button data-m="M">Manual</button><button data-m="O">Off</button>
+  </div>
+  <div class="slider" id="sl"><span class="sub">Speed</span>
+   <input type="range" id="duty" min="30" max="100" step="5" value="50">
+   <span id="dv">50 %</span></div>
+ </section>
 </div>
 <footer id="foot">waiting for the first reading</footer>
 </main>
 <script>
 const $ = id => document.getElementById(id);
+
+// Mode buttons and the manual speed slider.
+let shown = '', holdUntil = 0, synced = false;
+function showMode(m) {
+  shown = m;
+  document.querySelectorAll('#seg button')
+    .forEach(b => b.classList.toggle('on', b.dataset.m === m));
+  $('sl').classList.toggle('off', m !== 'M');
+}
+async function setMode(m) {
+  showMode(m);
+  holdUntil = Date.now() + 3000; // the fan needs a moment to report it back
+  let q = 'm=' + m;
+  if (m === 'M') q += '&duty=' + $('duty').value;
+  try { await fetch('/mode?' + q, { method: 'POST' }); } catch (e) {}
+}
+document.querySelectorAll('#seg button')
+  .forEach(b => b.onclick = () => setMode(b.dataset.m));
+$('duty').oninput = () => $('dv').textContent = $('duty').value + ' %';
+$('duty').onchange = () => setMode('M'); // moving the slider means manual
 const N = 300;              // 5 minutes at one reading a second
 const temps = [], hums = [];
 
@@ -130,6 +168,11 @@ async function tick() {
     g.animationDuration = (60 / (s.rpm / 20)).toFixed(2) + 's';
     g.animationPlayState = 'running';
   } else g.animationPlayState = 'paused';
+
+  if (Date.now() > holdUntil && s.mode !== shown) showMode(s.mode);
+  if (!synced && s.mode === 'M') { // start the slider where the fan already is
+    $('duty').value = s.duty; $('dv').textContent = s.duty + ' %'; synced = true;
+  }
 
   $('foot').textContent = 'lines from the STM32: ' + s.ok + ' good, ' + s.bad + ' bad';
 }
