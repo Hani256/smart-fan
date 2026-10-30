@@ -1,5 +1,6 @@
 #include "page.h"    // PAGE, the web page
 #include "secrets.h" // WIFI_SSID and WIFI_PASS, not in git
+#include "status_parse.h" // checks a status line, in lib/status_parse
 #include <Arduino.h>
 #include <ArduinoOTA.h> // upload new firmware over WiFi
 #include <ESPmDNS.h>    // so the phone can find it as smartfan.local
@@ -30,26 +31,13 @@ static Status st;
 
 static WebServer server(80);
 
-// Same checksum as the STM32: XOR of everything between '$' and '*'.
-static bool checksum_ok(const char *s) {
-  if (s[0] != '$')
-    return false;
-  const char *star = strchr(s, '*');
-  if (star == nullptr || strlen(star) < 3)
-    return false;
-
-  uint8_t x = 0;
-  for (const char *p = s + 1; p < star; p++)
-    x ^= (uint8_t)*p;
-
-  unsigned sent;
-  if (sscanf(star + 1, "%2X", &sent) != 1)
-    return false;
-  return sent == x;
-}
-
+// One line from the STM32. status_parse checks the checksum, the exact layout
+// and every range. Only a line that passes all of it changes what the page
+// shows and counts as a sign of life. Anything else counts once as bad and
+// changes nothing else.
 static void handle_line(const char *s) {
-  if (!checksum_ok(s)) {
+  status_msg_t m;
+  if (!status_parse(s, &m)) {
     bad++;
     Serial.printf("bad line: %s\n", s);
     return;
@@ -57,26 +45,14 @@ static void handle_line(const char *s) {
   good++;
   last_line_ms = millis();
 
-  int t10, h10;
-  unsigned duty;
-  unsigned long rpm;
-  char mode;
-
-  if (sscanf(s, "$S,%d,%d,%u,%lu,%c", &t10, &h10, &duty, &rpm, &mode) == 5) {
-    st.fresh = true;
-    st.temp_c = t10 / 10.0f;
-    st.hum_pct = h10 / 10.0f;
-    st.duty = duty;
-    st.rpm = rpm;
-    st.mode = mode;
-  } else if (sscanf(s, "$S,,,%u,%lu,%c", &duty, &rpm, &mode) == 3) {
-    st.fresh = false; // the STM32 says its reading is stale
-    st.duty = duty;
-    st.rpm = rpm;
-    st.mode = mode;
-  } else {
-    Serial.printf("did not understand: %s\n", s);
+  st.fresh = m.fresh; // stale: the STM32 says its reading is old
+  if (m.fresh) {
+    st.temp_c = m.temp10 / 10.0f;
+    st.hum_pct = m.hum10 / 10.0f;
   }
+  st.duty = m.duty;
+  st.rpm = m.rpm;
+  st.mode = m.mode;
 }
 
 static void send_page() { server.send(200, "text/html", PAGE); }
