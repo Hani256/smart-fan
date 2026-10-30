@@ -32,7 +32,14 @@
 uint8_t link_checksum(const char *p, int n);
 
 // Write the status line, with checksum and "\r\n", into buf. Returns its
-// length. temp_c and hum_pct are left out when fresh is 0.
+// length without the terminating '\0'. temp_c and hum_pct are left out when
+// fresh is 0.
+//
+// Returns -1 if buf is NULL, size is 0, or the whole line plus its '\0' does
+// not fit. Then nothing usable is in buf (it holds an empty string when size
+// is not 0), and the caller must not send it. LINK_STATUS_MAX_LEN bytes fit
+// the longest line any int temperature and humidity can produce.
+#define LINK_STATUS_MAX_LEN 64
 int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
                        float hum_pct, uint8_t duty_pct, uint32_t rpm,
                        fan_mode_t mode);

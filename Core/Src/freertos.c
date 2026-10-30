@@ -493,7 +493,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
 }
 
 void LinkTask(void *argument) {
-  static char buf[48]; // the line we send, must outlive the DMA transfer
+  static char buf[LINK_STATUS_MAX_LEN]; // must outlive the DMA transfer
 
   TickType_t next_wake = xTaskGetTickCount();
 
@@ -508,10 +508,12 @@ void LinkTask(void *argument) {
     fan_status_t f = {0};
     xQueuePeek(q_fan, &f, 0);
 
-        int n = link_format_status(buf, sizeof(buf), fresh, s.temp_c, s.hum_pct,
-                              f.duty_pct, f.rpm, f.mode);
+    int n = link_format_status(buf, sizeof(buf), fresh, s.temp_c, s.hum_pct,
+                               f.duty_pct, f.rpm, f.mode);
+    if (n <= 0)
+      continue; // could not build a line; never hand a bad length to DMA
 
-    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)buf, n) == HAL_OK) {
+    if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)buf, (uint16_t)n) == HAL_OK) {
       if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0)
         HAL_UART_AbortTransmit(&huart2); // took far too long, give up
     }

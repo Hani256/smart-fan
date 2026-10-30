@@ -13,6 +13,9 @@ uint8_t link_checksum(const char *p, int n) {
 int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
                        float hum_pct, uint8_t duty_pct, uint32_t rpm,
                        fan_mode_t mode) {
+  if (buf == NULL || size == 0)
+    return -1;
+
   int n;
   if (fresh)
     n = snprintf(buf, size, "$S,%d,%d,%u,%lu,%c", (int)(temp_c * 10),
@@ -21,10 +24,21 @@ int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
   else
     n = snprintf(buf, size, "$S,,,%u,%lu,%c", duty_pct, (unsigned long)rpm,
                  "AMO"[mode]);
+  // snprintf returns the length it wanted, not the length it wrote. Anything
+  // that did not fit means buf + n would point past the end.
+  if (n < 0 || (size_t)n >= size) {
+    buf[0] = '\0';
+    return -1;
+  }
 
   // checksum of everything after '$', then end the line
-  n += snprintf(buf + n, size - n, "*%02X\r\n", link_checksum(buf + 1, n - 1));
-  return n;
+  int m = snprintf(buf + n, size - (size_t)n, "*%02X\r\n",
+                   link_checksum(buf + 1, n - 1));
+  if (m < 0 || (size_t)m >= size - (size_t)n) {
+    buf[0] = '\0';
+    return -1;
+  }
+  return n + m;
 }
 
 // Value of one hex digit, or -1 if it is not one.

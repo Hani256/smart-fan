@@ -2,6 +2,7 @@
 // ESP32, and above all that a damaged line is never believed.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "link_proto.h"
@@ -59,6 +60,52 @@ void test_status_line_handles_temperatures_below_zero(void) {
   char buf[48];
   link_format_status(buf, sizeof(buf), 1, -5.0f, 80.0f, 0, 0, MODE_MANUAL);
   TEST_ASSERT_EQUAL_STRING("$S,-50,800,0,0,M*22\r\n", buf);
+}
+
+// The fresh line used in the size tests: 25 characters, plus '\0' = 26.
+static const char *FULL = "$S,234,452,40,1500,A*38\r\n";
+static int format_into(char *buf, size_t size) {
+  return link_format_status(buf, size, 1, 23.4f, 45.2f, 40, 1500, MODE_AUTO);
+}
+
+void test_status_line_fits_exactly_with_room_for_the_terminator(void) {
+  // A heap buffer of exactly this size, so AddressSanitizer catches a write
+  // even one byte past the end.
+  char *buf = malloc(26);
+  TEST_ASSERT_EQUAL_INT(25, format_into(buf, 26));
+  TEST_ASSERT_EQUAL_STRING(FULL, buf);
+  free(buf);
+}
+
+void test_status_line_one_byte_short_fails_cleanly(void) {
+  char *buf = malloc(25); // no room for the '\0'
+  TEST_ASSERT_EQUAL_INT(-1, format_into(buf, 25));
+  TEST_ASSERT_EQUAL_STRING("", buf);
+  free(buf);
+}
+
+void test_status_line_in_tiny_buffers_fails_cleanly(void) {
+  for (size_t size = 1; size < 25; size++) {
+    char *buf = malloc(size);
+    TEST_ASSERT_EQUAL_INT(-1, format_into(buf, size));
+    TEST_ASSERT_EQUAL_STRING("", buf);
+    free(buf);
+  }
+}
+
+void test_status_line_with_no_buffer_at_all(void) {
+  char sentinel = 'x';
+  TEST_ASSERT_EQUAL_INT(-1, format_into(&sentinel, 0));
+  TEST_ASSERT_EQUAL_CHAR('x', sentinel); // size 0: nothing written
+  TEST_ASSERT_EQUAL_INT(-1, format_into(NULL, 0));
+}
+
+void test_the_longest_possible_line_fits_the_documented_size(void) {
+  char buf[LINK_STATUS_MAX_LEN];
+  int n = link_format_status(buf, sizeof(buf), 1, -214748364.0f, -214748364.0f,
+                             100, 4294967295u, MODE_MANUAL);
+  TEST_ASSERT_GREATER_THAN_INT(0, n);
+  TEST_ASSERT_EQUAL_INT((int)strlen(buf), n);
 }
 
 void test_reads_auto(void) {
@@ -159,6 +206,11 @@ int main(void) {
   RUN_TEST(test_status_line_with_a_fresh_reading);
   RUN_TEST(test_status_line_leaves_a_stale_reading_out);
   RUN_TEST(test_status_line_handles_temperatures_below_zero);
+  RUN_TEST(test_status_line_fits_exactly_with_room_for_the_terminator);
+  RUN_TEST(test_status_line_one_byte_short_fails_cleanly);
+  RUN_TEST(test_status_line_in_tiny_buffers_fails_cleanly);
+  RUN_TEST(test_status_line_with_no_buffer_at_all);
+  RUN_TEST(test_the_longest_possible_line_fits_the_documented_size);
   RUN_TEST(test_reads_auto);
   RUN_TEST(test_reads_off);
   RUN_TEST(test_reads_manual_with_its_speed);
