@@ -1,8 +1,9 @@
 #include "secrets.h" // WIFI_SSID and WIFI_PASS, not in git
 #include <Arduino.h>
-#include <ESPmDNS.h>   // so the phone can find it as smartfan.local
-#include <WebServer.h> // serve the page
-#include <WiFi.h>      // connect to the home network
+#include <ArduinoOTA.h> // upload new firmware over WiFi
+#include <ESPmDNS.h>    // so the phone can find it as smartfan.local
+#include <WebServer.h>  // serve the page
+#include <WiFi.h>       // connect to the home network
 
 // Wiring: ESP32 GPIO16 (RX) <- STM32 PA2 (TX)
 //         ESP32 GPIO4  (TX) -> STM32 PA3 (RX)
@@ -86,7 +87,7 @@ body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;paddin
 </style></head><body>
 <div class="l">Temperature</div><div class="v" id="t">--</div>
 <div class="l">Humidity</div><div class="v" id="h">--</div>
-<div class="l">Fan</div><div class="v" id="f">--</div>
+<div class="l">Fan speed</div><div class="v" id="f">--</div>
 <div id="link">waiting...</div>
 <script>
 const $ = id => document.getElementById(id);
@@ -119,30 +120,38 @@ static void send_status() {
   server.send(200, "application/json", json);
 }
 
-// Join the home network, then start the web server. Gives up after about
-// 10 s so the serial link keeps working even without WiFi.
-static void wifi_start() {
-  WiFi.setHostname("smartfan");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+static bool online = false;      // web server and OTA are running
+static uint32_t last_try_ms = 0; // when we last asked the router
 
-  Serial.print("connecting to WiFi");
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(250);
-    Serial.print(".");
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nno WiFi. Check secrets.h, then press EN to try again");
+// Ask the router to let us in. Drops any half-finished attempt first.
+static void wifi_begin() {
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  last_try_ms = millis();
+}
+
+// Called from loop(). Once connected, starts the page and OTA (only once).
+// Until then, tries again every 10 s, because a router may refuse the first
+// attempt right after the ESP32 was reset.
+static void wifi_poll() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!online) {
+      server.on("/", send_page);
+      server.on("/status.json", send_status);
+      server.begin();
+      ArduinoOTA.setHostname("smartfan"); // also makes smartfan.local work
+      ArduinoOTA.setPassword(OTA_PASS);
+      ArduinoOTA.begin();
+      Serial.printf("connected: http://%s/  (OTA ready)\n",
+                    WiFi.localIP().toString().c_str());
+      online = true;
+    }
     return;
   }
-  Serial.printf("\nconnected: http://%s/\n", WiFi.localIP().toString().c_str());
-
-  if (MDNS.begin("smartfan"))
-    Serial.println("also at: http://smartfan.local/");
-
-  server.on("/", send_page);
-  server.on("/status.json", send_status);
-  server.begin();
+  if (millis() - last_try_ms > 10000) {
+    Serial.println("no WiFi yet, trying again");
+    wifi_begin();
+  }
 }
 
 void setup() {
@@ -150,11 +159,17 @@ void setup() {
   Serial2.begin(115200, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN); // to the STM32
   Serial.println("listening for the STM32");
   last_line_ms = millis();
-  wifi_start();
+  WiFi.setHostname("smartfan");
+  WiFi.mode(WIFI_STA);
+  wifi_begin(); // does not wait; wifi_poll() in loop() takes it from here
 }
 
 void loop() {
-  server.handleClient(); // answer the phone, if it asked for something
+  wifi_poll();
+  if (online) {
+    ArduinoOTA.handle();   // a new firmware arriving over WiFi?
+    server.handleClient(); // answer the phone, if it asked for something
+  }
 
   while (Serial2.available()) {
     char c = (char)Serial2.read();
