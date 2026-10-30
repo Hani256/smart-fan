@@ -30,8 +30,10 @@ on that below, because it turned out to be the most interesting part.
 - An ESP32 on the same board joins the home WiFi and serves a dashboard with
   live values, the last five minutes as small graphs, and the mode controls.
   Its firmware is updated over WiFi
-- 25 unit tests for the control logic and the serial protocol, run by GitHub
-  Actions on every push together with a build of both firmwares
+- 47 unit tests for the control logic, the serial protocol on both ends and
+  the ESP32's line parser, run by GitHub Actions on every push, once plainly
+  and once under AddressSanitizer and UndefinedBehaviorSanitizer, together
+  with a build of both firmwares
 
 ## The board: 3D printed, with copper tape tracks
 
@@ -142,7 +144,8 @@ integral just climbs into its limit. What it uses now is a curve:
 - in between, a straight line from 30 %, the slowest speed at which this fan
   starts reliably, up to 100 %
 - it switches on at 21 C but only off again at 20 C, so a temperature that
-  sits on the threshold cannot make it chatter
+  sits on the threshold cannot make it chatter. In between, once it is
+  running, it holds 30 %
 - the speed changes by at most 10 % a second, because a sudden change in
   airflow is what a person notices
 - starting from standstill it gets 400 ms at full power first
@@ -166,9 +169,12 @@ $M,A*20  $M,O*2E           command: Auto, Off
 ```
 
 The two hex digits at the end are an NMEA style checksum, the XOR of every
-character between `$` and `*`. A line that fails it is thrown away, so a
-damaged byte can never turn into a wrong value. The format and parsing live
-in [`App/link_proto.c`](App/link_proto.c).
+character between `$` and `*`. Both ends are strict: the checksum has to be
+exactly two hex digits, the line has to match its layout completely, numbers
+are digits only and every value has to be in range. Anything else is thrown
+away whole, so a damaged byte can never turn into a wrong value. The STM32
+side lives in [`App/link_proto.c`](App/link_proto.c), the ESP32 side in
+[`esp32/lib/status_parse`](esp32/lib/status_parse/status_parse.c).
 
 ## The ESP32 and the dashboard
 
@@ -177,7 +183,8 @@ in [`App/link_proto.c`](App/link_proto.c).
 <p align="center"><img src="docs/images/dashboard-phone.jpg" alt="The dashboard on a phone, in manual mode" width="300"></p>
 
 The ESP32 (Arduino framework, built with PlatformIO) reads the status lines,
-checks them, and serves a small web page from its own flash, so it works
+checks them, and only lets a line that passes every check change what the
+page shows. It serves a small web page from its own flash, so it works
 without internet. The page asks for `/status.json` once a second and draws
 the values, a graph of the last five minutes, and a spinning fan whose speed
 follows the real RPM. The mode buttons and the slider send `POST /mode`,
@@ -198,7 +205,8 @@ Some details that took some finding:
 
 ### Unit tests
 
-The control logic and the protocol are tested on the computer with
+The control logic, the protocol and the ESP32's line parser are tested on
+the computer with
 [Unity](https://github.com/ThrowTheSwitch/Unity), no board needed. Each test
 is a small story about how the fan should behave, for example
 `test_temperature_on_the_threshold_does_not_make_it_chatter` or
@@ -212,7 +220,17 @@ cmake --build build/tests
 ctest --test-dir build/tests --output-on-failure
 ```
 
-Writing them found two real bugs, both now fixed:
+To run the same tests under AddressSanitizer and UndefinedBehaviorSanitizer,
+configure with `-DSANITIZE=ON`. The flags only reach the test programs,
+never the firmware:
+
+```
+cmake -S tests -B build/tests-san -DSANITIZE=ON
+cmake --build build/tests-san
+ctest --test-dir build/tests-san --output-on-failure
+```
+
+Writing the first tests found two real bugs, both now fixed:
 
 - **Manual speed below 30 % made the fan surge.** The protocol allows any
   speed from 0 to 100. Asked for 20 %, the slew limit and the start speed
@@ -222,10 +240,29 @@ Writing them found two real bugs, both now fixed:
   command itself was intact, but a protocol that accepts a damaged line is
   not doing its job. The checksum now has to be exactly two hex digits
 
+A later review, and the sanitizer build, found four more:
+
+- **A negative float was cast to `uint8_t`.** With the fan running and the
+  room between 20 and 21 C, the curve came out negative before the cast,
+  which is undefined behaviour. UBSan stopped the existing hysteresis test
+  on it. The fan now holds its start speed in that band
+- **`$M,M,60junk` was accepted as manual 60 %.** `sscanf` stops quietly at
+  the first character it does not expect. Commands are now parsed by hand,
+  and the tests sign every malformed line with its real checksum, so they
+  test the syntax check and not the checksum
+- **A buffer too small for the status line was overrun.** The formatter
+  used the length `snprintf` wanted as the length it had written.
+  AddressSanitizer shows the overflow. It now returns -1 and the sender
+  skips that round instead of handing -1 to DMA
+- **The ESP32 believed a line before checking it.** It counted a line as
+  good before parsing it and read the fields with `sscanf`. Its parser now
+  checks the whole line and every range first
+
 ### CI
 
-GitHub Actions runs three jobs on every push: the unit tests, the STM32
-firmware build with the ARM toolchain, and the ESP32 build with PlatformIO.
+GitHub Actions runs four jobs on every push: the unit tests, the same tests
+under the sanitizers, the STM32 firmware build with the ARM toolchain, and
+the ESP32 build with PlatformIO.
 
 ### On the board
 
@@ -297,8 +334,9 @@ the `ota` environment over WiFi after that.
 
 ## Known limits
 
-- The ESP32 checks the checksum of incoming lines the same lenient way the
-  STM32 did before the tests caught it. Same fix, not done yet
+- The STM32 turns temperature and humidity into tenths with a plain cast to
+  `int`. That is only safe because `SensorTask` drops any reading outside
+  -20 to 80 C and 0 to 100 % before it reaches the formatter
 - A mode change takes up to a second to reach the fan, because `FanTask`
   looks at its command queue once per period. Fine for a fan, and easy to
   make immediate by blocking on the queue instead
