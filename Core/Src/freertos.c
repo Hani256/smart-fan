@@ -29,9 +29,11 @@
 #include "queue.h"         // xQueueCreate, xQueueOverwrite, xQueuePeek
 #include "ssd1306.h"       // OLED driver
 #include "ssd1306_fonts.h" // OLED fonts
+#include "stream_buffer.h" // bytes from the UART interrupt to LinkRxTask
 #include "tim.h"           // htim1 (fan PWM) and htim2 (tach capture)
 #include "usart.h"         // huart2, the serial link to the ESP32
 #include <stdio.h>         // snprintf: builds text strings
+#include <string.h>        // strchr, strncmp: reading commands
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -87,7 +89,7 @@ typedef struct {
 #define TEMP_STALE_MS       5000                   // a reading older than this is not a reading any more
 #define FAN_SAFE_DUTY       50 // what the fan runs at when it has nothing to go on
 #define MANUAL_DUTY_DEFAULT 50 // manual speed until someone picks another
-#define BUTTON_SETTLE_MS 30    // how long a contact may bounce
+#define BUTTON_SETTLE_MS    30    // how long a contact may bounce
 
 // Tach edges closer together than this are noise, not the fan. Two pulses per
 // turn, so 5000 us between them would be 6000 rpm, twice the 3000 rpm this
@@ -96,6 +98,7 @@ typedef struct {
 #define TACH_MIN_GAP_US     5000
 // The status line to the ESP32 goes out this often.
 #define LINK_PERIOD_MS      1000
+#define LINK_RX_DMA_SIZE    64 // DMA fills this round and round with bytes from the ESP32
 
 /* USER CODE END PD */
 
@@ -124,6 +127,13 @@ volatile uint32_t temp_errors = 0; // SensorTask only, never crosses a task
 volatile uint32_t tach_pulses = 0; // written by the TIM2 ISR, read by FanTask
 static TaskHandle_t link_task;     // The UART transmit-complete interrupt wakes this task, so it needs the handle.
 static TaskHandle_t button_task;   // the EXTI0 interrupt wakes this task
+// Receiving from the ESP32. DMA writes every byte into link_rx_dma, going round
+// in circles. The UART callback copies whatever is new into the stream buffer,
+// and LinkRxTask reads it from there.
+static uint8_t link_rx_dma[LINK_RX_DMA_SIZE];
+static uint16_t link_rx_pos = 0;     // how far into link_rx_dma we have copied
+static StreamBufferHandle_t link_rx; // UART interrupt to LinkRxTask
+volatile uint32_t link_rx_bad = 0; // commands with a wrong checksum, for the debugger
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
@@ -144,6 +154,7 @@ void LinkTask(
     void *argument); // our own task: sends the status to the ESP32 over USART2
 void ButtonTask(
     void *argument); // our own task: turns presses on PA0 into mode changes
+void LinkRxTask(void *argument); // our own task: reads commands from the ESP32
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -216,8 +227,11 @@ void MX_FREERTOS_Init(void) {
   q_sensor = xQueueCreate(1, sizeof(sensor_sample_t));
   q_fan = xQueueCreate(1, sizeof(fan_status_t));
   q_cmd = xQueueCreate(4, sizeof(fan_cmd_t));
-  configASSERT(q_sensor != NULL && q_fan != NULL &&
-               q_cmd != NULL); // NULL here means the heap is too small
+  // 128 bytes is several commands. Trigger level 1: wake the reader as soon
+  // as a single byte is there.
+  link_rx = xStreamBufferCreate(128, 1);
+  configASSERT(q_sensor != NULL && q_fan != NULL && q_cmd != NULL &&
+               link_rx != NULL); // NULL here means the heap is too small
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -248,6 +262,9 @@ void MX_FREERTOS_Init(void) {
   // Button task: tiny stack, it only reads a pin and sends a command.
   xTaskCreate(ButtonTask, "button", 128, NULL,
               (UBaseType_t)osPriorityBelowNormal, &button_task);
+  // Receiving side of the link, same priority as the sending side.
+  xTaskCreate(LinkRxTask, "link_rx", 256, NULL, (UBaseType_t)osPriorityLow4,
+              NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -576,11 +593,12 @@ void LinkTask(void *argument) {
 
     int n;
     if (fresh)
-      n = snprintf(buf, sizeof(buf), "$S,%d,%d,%u,%lu", (int)(s.temp_c * 10),
-                   (int)(s.hum_pct * 10), f.duty_pct, (unsigned long)f.rpm);
+      n = snprintf(buf, sizeof(buf), "$S,%d,%d,%u,%lu,%c", (int)(s.temp_c * 10),
+                   (int)(s.hum_pct * 10), f.duty_pct, (unsigned long)f.rpm,
+                   "AMO"[f.mode]);
     else
-      n = snprintf(buf, sizeof(buf), "$S,,,%u,%lu", f.duty_pct,
-                   (unsigned long)f.rpm);
+      n = snprintf(buf, sizeof(buf), "$S,,,%u,%lu,%c", f.duty_pct,
+                   (unsigned long)f.rpm, "AMO"[f.mode]);
 
     // checksum of everything after '$', then end the line
     n += snprintf(buf + n, sizeof(buf) - n, "*%02X\r\n",
@@ -628,6 +646,93 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
     BaseType_t woken = pdFALSE;
     vTaskNotifyGiveFromISR(button_task, &woken); // wake ButtonTask
     portYIELD_FROM_ISR(woken);
+  }
+}
+
+// A command from the ESP32, one of:
+//
+//   $M,A*hh       automatic
+//   $M,O*hh       off
+//   $M,M,60*hh    manual, at 60 %
+//
+// Same checksum as the status line. Anything damaged or unknown is ignored.
+static void link_handle_command(const char *s) {
+  const char *star = strchr(s, '*');
+  if (s[0] != '$' || star == NULL || strlen(star) < 3)
+    return;
+  unsigned sent;
+  if (sscanf(star + 1, "%2x", &sent) != 1 ||
+      link_checksum(s + 1, star - s - 1) != sent) {
+    link_rx_bad++;
+    return;
+  }
+
+  fan_cmd_t c = {0};
+  unsigned duty;
+  if (strncmp(s, "$M,A*", 5) == 0)
+    c.mode = MODE_AUTO;
+  else if (strncmp(s, "$M,O*", 5) == 0)
+    c.mode = MODE_OFF;
+  else if (sscanf(s, "$M,M,%u*", &duty) == 1 && duty <= 100) {
+    c.mode = MODE_MANUAL;
+    c.duty_pct = (uint8_t)duty;
+  } else
+    return;
+
+  xQueueSend(q_cmd, &c, 0); // the same queue the button uses
+}
+
+// Collects bytes from the stream buffer into lines, like the ESP32 does.
+void LinkRxTask(void *argument) {
+  char line[32];
+  size_t len = 0;
+
+  // Start receiving. From here on DMA fills link_rx_dma by itself, and the
+  // callback below hands over whatever is new.
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, link_rx_dma, sizeof(link_rx_dma));
+
+  for (;;) {
+    uint8_t c;
+    xStreamBufferReceive(link_rx, &c, 1,
+                         portMAX_DELAY); // sleep until a byte comes
+    if (c == '\n') {
+      if (len > 0 && line[len - 1] == '\r')
+        len--;
+      line[len] = '\0';
+      if (len > 0)
+        link_handle_command(line);
+      len = 0;
+    } else if (len < sizeof(line) - 1) {
+      line[len++] = (char)c;
+    } else {
+      len = 0; // too long to be a command, start over
+    }
+  }
+}
+
+// HAL calls this when DMA is half full, completely full, or the line has gone
+// quiet. Size is how far into link_rx_dma the DMA has written by now.
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+  if (huart->Instance != USART2)
+    return;
+  BaseType_t woken = pdFALSE;
+  if (Size > link_rx_pos) { // new bytes since last time
+    xStreamBufferSendFromISR(link_rx, &link_rx_dma[link_rx_pos],
+                             Size - link_rx_pos, &woken);
+  } else if (Size < link_rx_pos) { // DMA went round the end of the buffer
+    xStreamBufferSendFromISR(link_rx, &link_rx_dma[link_rx_pos],
+                             sizeof(link_rx_dma) - link_rx_pos, &woken);
+    xStreamBufferSendFromISR(link_rx, link_rx_dma, Size, &woken);
+  }
+  link_rx_pos = (Size == sizeof(link_rx_dma)) ? 0 : Size;
+  portYIELD_FROM_ISR(woken);
+}
+
+// A noise burst or an overrun makes HAL stop receiving. Start it again.
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART2) {
+    link_rx_pos = 0;
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, link_rx_dma, sizeof(link_rx_dma));
   }
 }
 /* USER CODE END Application */
