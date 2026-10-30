@@ -1,6 +1,7 @@
 // Tests for App/link_proto.c: the lines that go between the STM32 and the
 // ESP32, and above all that a damaged line is never believed.
 
+#include <stdio.h>
 #include <string.h>
 
 #include "link_proto.h"
@@ -16,6 +17,24 @@ void setUp(void) {
 void tearDown(void) {}
 
 static int parse(const char *s) { return link_parse_command(s, &mode, &duty); }
+
+// Build "$<payload>*hh" with the checksum the payload really has, so a test
+// that expects rejection is testing the syntax check, not the checksum.
+static const char *signed_line(const char *payload) {
+  static char line[64];
+  snprintf(line, sizeof(line), "$%s*%02X", payload,
+           link_checksum(payload, (int)strlen(payload)));
+  return line;
+}
+
+// A rejected line must leave both outputs exactly as they were.
+static void assert_rejected(const char *payload) {
+  mode = (fan_mode_t)99;
+  duty = 255;
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, parse(signed_line(payload)), payload);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(99, mode, payload);
+  TEST_ASSERT_EQUAL_UINT8_MESSAGE(255, duty, payload);
+}
 
 void test_checksum_matches_a_value_worked_out_by_hand(void) {
   const char *body = "S,234,452,40,1500";
@@ -95,6 +114,45 @@ void test_any_single_damaged_character_is_caught(void) {
   }
 }
 
+void test_rejects_manual_speeds_with_anything_but_digits(void) {
+  assert_rejected("M,M,60junk"); // sscanf used to stop at the junk and accept
+  assert_rejected("M,M,+60");
+  assert_rejected("M,M,-1");
+  assert_rejected("M,M, 60");
+  assert_rejected("M,M,60 ");
+  assert_rejected("M,M,6 0");
+  assert_rejected("M,M,0x10");
+}
+
+void test_rejects_missing_and_extra_fields(void) {
+  assert_rejected("M,M,");
+  assert_rejected("M,M");
+  assert_rejected("M,M,60,1");
+  assert_rejected("M,A,1");
+  assert_rejected("M,A ");
+  assert_rejected("M,AX");
+  assert_rejected("M,O,");
+  assert_rejected("M,");
+  assert_rejected("M");
+}
+
+void test_rejects_manual_speeds_out_of_range_or_too_long(void) {
+  assert_rejected("M,M,101");
+  assert_rejected("M,M,999");
+  assert_rejected("M,M,1000");
+  assert_rejected("M,M,0100");       // four digits, even though it is 100
+  assert_rejected("M,M,4294967356"); // wraps to 60 in a 32 bit unsigned
+}
+
+void test_accepts_the_whole_manual_range(void) {
+  TEST_ASSERT_EQUAL_INT(1, parse(signed_line("M,M,0")));
+  TEST_ASSERT_EQUAL_UINT8(0, duty);
+  TEST_ASSERT_EQUAL_INT(1, parse(signed_line("M,M,100")));
+  TEST_ASSERT_EQUAL_UINT8(100, duty);
+  TEST_ASSERT_EQUAL_INT(1, parse(signed_line("M,M,7")));
+  TEST_ASSERT_EQUAL_UINT8(7, duty);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_checksum_matches_a_value_worked_out_by_hand);
@@ -109,5 +167,9 @@ int main(void) {
   RUN_TEST(test_rejects_commands_it_does_not_know);
   RUN_TEST(test_rejects_lines_that_are_not_commands_at_all);
   RUN_TEST(test_any_single_damaged_character_is_caught);
+  RUN_TEST(test_rejects_manual_speeds_with_anything_but_digits);
+  RUN_TEST(test_rejects_missing_and_extra_fields);
+  RUN_TEST(test_rejects_manual_speeds_out_of_range_or_too_long);
+  RUN_TEST(test_accepts_the_whole_manual_range);
   return UNITY_END();
 }

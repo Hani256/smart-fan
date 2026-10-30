@@ -39,6 +39,9 @@ int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
 
 // Read one command line, without the "\r\n". Returns 1 and fills in *mode
 // and *duty_pct if it is a valid command, 0 if it is damaged or unknown.
+// The syntax is exact: manual speed is 1 to 3 decimal digits from 0 to 100,
+// with no sign, spaces or anything else before the '*'. On 0, *mode and
+// *duty_pct are left as they were.
 int link_parse_command(const char *s, fan_mode_t *mode, uint8_t *duty_pct);
 
 #endif

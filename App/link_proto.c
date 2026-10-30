@@ -1,6 +1,5 @@
 #include "link_proto.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -28,28 +27,61 @@ int link_format_status(char *buf, size_t size, uint8_t fresh, float temp_c,
   return n;
 }
 
-int link_parse_command(const char *s, fan_mode_t *mode, uint8_t *duty_pct) {
-  const char *star = strchr(s, '*');
-  // The checksum must be exactly two hex digits and nothing after them.
-  // sscanf alone would also take " 6", because %x skips spaces.
-  if (s[0] != '$' || star == NULL || strlen(star) != 3 ||
-      !isxdigit((unsigned char)star[1]) || !isxdigit((unsigned char)star[2]))
+// Value of one hex digit, or -1 if it is not one.
+static int hex_value(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  return -1;
+}
+
+// The manual speed: one to three decimal digits and nothing else, worth at
+// most 100. No sign, no spaces. Limiting the length means the value can never
+// overflow while it is being added up.
+static int parse_duty(const char *p, const char *end, uint8_t *duty_pct) {
+  if (p >= end || end - p > 3)
     return 0;
-  unsigned sent;
-  if (sscanf(star + 1, "%2x", &sent) != 1 ||
-      link_checksum(s + 1, (int)(star - s - 1)) != sent)
+  unsigned v = 0;
+  for (; p < end; p++) {
+    if (*p < '0' || *p > '9')
+      return 0;
+    v = v * 10 + (unsigned)(*p - '0');
+  }
+  if (v > 100)
+    return 0;
+  *duty_pct = (uint8_t)v;
+  return 1;
+}
+
+int link_parse_command(const char *s, fan_mode_t *mode, uint8_t *duty_pct) {
+  // The checksum must be exactly two hex digits and nothing after them.
+  const char *star = strchr(s, '*');
+  if (s[0] != '$' || star == NULL || strlen(star) != 3)
+    return 0;
+  int hi = hex_value(star[1]), lo = hex_value(star[2]);
+  if (hi < 0 || lo < 0 ||
+      link_checksum(s + 1, (int)(star - s - 1)) != (uint8_t)(hi * 16 + lo))
     return 0; // damaged
 
-  unsigned duty;
-  if (strncmp(s, "$M,A*", 5) == 0) {
+  // The payload, from '$' up to '*', must be one of the commands exactly.
+  // Nothing is written to *mode or *duty_pct unless the whole line is valid.
+  size_t len = (size_t)(star - s);
+  if (len == 4 && strncmp(s, "$M,A", 4) == 0) {
     *mode = MODE_AUTO;
-  } else if (strncmp(s, "$M,O*", 5) == 0) {
-    *mode = MODE_OFF;
-  } else if (sscanf(s, "$M,M,%u*", &duty) == 1 && duty <= 100) {
-    *mode = MODE_MANUAL;
-    *duty_pct = (uint8_t)duty;
-  } else {
-    return 0; // not a command we know
+    return 1;
   }
-  return 1;
+  if (len == 4 && strncmp(s, "$M,O", 4) == 0) {
+    *mode = MODE_OFF;
+    return 1;
+  }
+  uint8_t duty;
+  if (len > 5 && strncmp(s, "$M,M,", 5) == 0 && parse_duty(s + 5, star, &duty)) {
+    *mode = MODE_MANUAL;
+    *duty_pct = duty;
+    return 1;
+  }
+  return 0; // not a command we know, or not exactly one
 }
