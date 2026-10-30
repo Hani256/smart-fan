@@ -44,10 +44,25 @@ typedef struct {
   uint32_t stamp_ms;
 } sensor_sample_t;
 
+// What the fan should do. Changed by the button, and later from the phone.
+typedef enum {
+  MODE_AUTO = 0, // follow the temperature curve
+  MODE_MANUAL,   // fixed speed
+  MODE_OFF,      // stopped
+  MODE_NEXT,     // only in commands: "go to the next mode" (the button)
+} fan_mode_t;
+
+// One request to change the mode. Travels through q_cmd to FanTask.
+typedef struct {
+  fan_mode_t mode;
+  uint8_t duty_pct; // only used with MODE_MANUAL
+} fan_cmd_t;
+
 // What the fan is doing right now, for the display.
 typedef struct {
   uint8_t duty_pct;
   uint32_t rpm;
+  fan_mode_t mode; // which mode the fan is in
 } fan_status_t;
 /* USER CODE END PTD */
 
@@ -60,27 +75,27 @@ typedef struct {
 // to. What this needs is a comfort curve: this warm means this fast. Set these
 // four numbers to what feels right to you, that is the correct way to tune
 // them.
-#define FAN_T_ON 21.0f    // start blowing at or above this
-#define FAN_T_OFF 20.0f   // and stop again only once it has dropped to here
-#define FAN_T_FULL 25.0f  // full speed at or above this
-#define FAN_DUTY_START 30 // the slowest duty at which the fan actually turns
-#define FAN_DUTY_MAX 100
-#define FAN_SLEW_PER_S 10 // the most the duty may change in one second
-#define FAN_KICK_MS                                                            \
-  400 // full power for this long when starting from standstill
+#define FAN_T_ON            21.0f    // start blowing at or above this
+#define FAN_T_OFF           20.0f   // and stop again only once it has dropped to here
+#define FAN_T_FULL          25.0f  // full speed at or above this
+#define FAN_DUTY_START      30 // the slowest duty at which the fan actually turns
+#define FAN_DUTY_MAX        100
+#define FAN_SLEW_PER_S      10 // the most the duty may change in one second
+#define FAN_KICK_MS         400 // full power for this long when starting from standstill
 
 // How we behave when we do not have a temperature we believe in.
-#define TEMP_STALE_MS                                                          \
-  5000                   // a reading older than this is not a reading any more
-#define FAN_SAFE_DUTY 50 // what the fan runs at when it has nothing to go on
+#define TEMP_STALE_MS       5000                   // a reading older than this is not a reading any more
+#define FAN_SAFE_DUTY       50 // what the fan runs at when it has nothing to go on
+#define MANUAL_DUTY_DEFAULT 50 // manual speed until someone picks another
+#define BUTTON_SETTLE_MS 30    // how long a contact may bounce
 
 // Tach edges closer together than this are noise, not the fan. Two pulses per
 // turn, so 5000 us between them would be 6000 rpm, twice the 3000 rpm this
 // fan (an ARCTIC P12 Pro) is rated for. A real pulse train never comes this
 // close.
-#define TACH_MIN_GAP_US 5000
+#define TACH_MIN_GAP_US     5000
 // The status line to the ESP32 goes out this often.
-#define LINK_PERIOD_MS 1000
+#define LINK_PERIOD_MS      1000
 
 /* USER CODE END PD */
 
@@ -103,10 +118,12 @@ typedef struct {
 // critical section, so from any other task there is no half-written state.
 QueueHandle_t q_sensor; // SensorTask to FanTask: the temperature
 QueueHandle_t q_fan;    // FanTask to SensorTask: duty and rpm, for the screen
+QueueHandle_t q_cmd;    // button and ESP32 to FanTask: mode changes
 
 volatile uint32_t temp_errors = 0; // SensorTask only, never crosses a task
 volatile uint32_t tach_pulses = 0; // written by the TIM2 ISR, read by FanTask
 static TaskHandle_t link_task;     // The UART transmit-complete interrupt wakes this task, so it needs the handle.
+static TaskHandle_t button_task;   // the EXTI0 interrupt wakes this task
 /* USER CODE END Variables */
 
 /* Definitions for defaultTask */
@@ -124,7 +141,9 @@ void SensorTask(
 void FanTask(
     void *argument); // our own task: drives the fan PWM and measures its RPM
 void LinkTask(
-    void *argument); // our own task: sends the status to the ESP32 over USART2Variables
+    void *argument); // our own task: sends the status to the ESP32 over USART2
+void ButtonTask(
+    void *argument); // our own task: turns presses on PA0 into mode changes
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -196,8 +215,9 @@ void MX_FREERTOS_Init(void) {
   // the time anyone looks in them.
   q_sensor = xQueueCreate(1, sizeof(sensor_sample_t));
   q_fan = xQueueCreate(1, sizeof(fan_status_t));
-  configASSERT(q_sensor != NULL &&
-               q_fan != NULL); // NULL here means the heap is too small
+  q_cmd = xQueueCreate(4, sizeof(fan_cmd_t));
+  configASSERT(q_sensor != NULL && q_fan != NULL &&
+               q_cmd != NULL); // NULL here means the heap is too small
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -209,7 +229,7 @@ void MX_FREERTOS_Init(void) {
   // Priorities, lowest to highest:
   //   defaultTask (LED blink)  osPriorityLow          8
   //   link to the ESP32        osPriorityLow4        12
-  //   sensor                   osPriorityBelowNormal 16
+  //   sensor, button           osPriorityBelowNormal 16
   //   fan                      osPriorityNormal      24
   // The blink task is set in CubeMX and created with the CMSIS API, which uses
   // these same numbers, so ours use the CMSIS names too. That keeps all three
@@ -225,6 +245,9 @@ void MX_FREERTOS_Init(void) {
   // sensor and the fan: if the ESP32 misses a line, nothing bad happens.
   xTaskCreate(LinkTask, "link", 384, NULL, (UBaseType_t)osPriorityLow4,
               &link_task);
+  // Button task: tiny stack, it only reads a pin and sends a command.
+  xTaskCreate(ButtonTask, "button", 128, NULL,
+              (UBaseType_t)osPriorityBelowNormal, &button_task);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -373,8 +396,8 @@ void SensorTask(void *argument) {
              h10 % 10);                           // e.g. "H 45.2 %"
     ssd1306_WriteString(line, Font_11x18, White); // draw it
     ssd1306_SetCursor(0, 44);                     // third line
-    snprintf(line, sizeof(line), "F %lu %u%%", (unsigned long)f.rpm,
-             f.duty_pct); // e.g. "F 1500 40%"
+    snprintf(line, sizeof(line), "%c %lu %u%%", "AMO"[f.mode],
+             (unsigned long)f.rpm, f.duty_pct);   // e.g. "A 1500 40%"
     ssd1306_WriteString(line, Font_11x18, White); // draw it
     ssd1306_UpdateScreen(); // send the whole buffer to the OLED
 
@@ -392,6 +415,9 @@ void FanTask(void *argument) {
   uint8_t fan_on = 0;    // the hysteresis state: is it currently blowing?
   uint16_t duty_now = 0; // what we are actually commanding, after slew limiting
 
+  fan_mode_t mode = MODE_AUTO; // start in automatic
+  uint8_t manual_duty = MANUAL_DUTY_DEFAULT;
+
   sensor_sample_t s;     // the latest sample we peeked out of the mailbox
   fan_status_t st = {0}; // what we publish back for the screen
 
@@ -402,6 +428,18 @@ void FanTask(void *argument) {
 
   for (;;) {
     uint16_t want = 0; // what the curve asks for, before slew limiting
+
+    // Take every command that arrived since the last round.
+    fan_cmd_t c;
+    while (xQueueReceive(q_cmd, &c, 0) == pdTRUE) {
+      if (c.mode == MODE_NEXT) {
+        mode = (mode == MODE_OFF) ? MODE_AUTO : (fan_mode_t)(mode + 1);
+      } else {
+        mode = c.mode;
+        if (mode == MODE_MANUAL)
+          manual_duty = c.duty_pct;
+      }
+    }
 
     // Peek, not receive: the sample stays in the mailbox, so a round in which
     // the sensor said nothing still sees the last thing it did say. The
@@ -414,7 +452,13 @@ void FanTask(void *argument) {
       temp_fresh = (HAL_GetTick() - s.stamp_ms) < TEMP_STALE_MS;
     }
 
-    if (!temp_fresh) {
+    if (mode == MODE_OFF) {
+      want = 0;
+      fan_on = 0; // back in auto, the curve starts fresh
+    } else if (mode == MODE_MANUAL) {
+      want = manual_duty;
+      fan_on = 0;
+    } else if (!temp_fresh) {
       want = FAN_SAFE_DUTY; // nothing to go on, so stop pretending to control
       fan_on = 0;           // and make a returning sensor start the curve fresh
     } else {
@@ -456,7 +500,9 @@ void FanTask(void *argument) {
     }
 
     uint32_t duty = duty_now;
+    st.mode = mode;
     st.duty_pct = (uint8_t)duty;
+
     xQueueOverwrite(q_fan, &st); // publish it, so the OLED can show it
 
     if (starting) {
@@ -551,6 +597,36 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
     BaseType_t woken = pdFALSE;
     vTaskNotifyGiveFromISR(link_task, &woken); // wake LinkTask
+    portYIELD_FROM_ISR(woken);
+  }
+}
+
+// Sleeps until the button interrupt wakes it, then decides whether that was a
+// real press or just the contact bouncing.
+void ButtonTask(void *argument) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // sleep until PA0 falls
+
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_SETTLE_MS)); // let the contact settle
+    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET) {
+      // Still pressed after the bounce: a real press.
+      fan_cmd_t c = {.mode = MODE_NEXT};
+      xQueueSend(q_cmd, &c, 0); // if the queue is full, drop this press
+
+      // Wait for the release, so holding the button counts once.
+      while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET)
+        vTaskDelay(pdMS_TO_TICKS(10));
+      vTaskDelay(pdMS_TO_TICKS(BUTTON_SETTLE_MS)); // the release bounces too
+    }
+    ulTaskNotifyTake(pdTRUE, 0); // forget the edges the bouncing caused
+  }
+}
+
+// HAL calls this from the EXTI0 interrupt when PA0 falls (button pressed).
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+  if (GPIO_Pin == GPIO_PIN_0) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(button_task, &woken); // wake ButtonTask
     portYIELD_FROM_ISR(woken);
   }
 }
