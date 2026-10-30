@@ -71,7 +71,7 @@ border-radius:9px;padding:10px 0;cursor:pointer}
   <div class="sub">last 5 minutes</div>
   <svg class="spark" viewBox="0 0 100 30" preserveAspectRatio="none"><path id="hp" stroke="var(--hum)"/></svg>
  </section>
- <section class="card">
+ <section class="card" id="cf">
   <div class="label"><span class="swatch" style="background:var(--fan)"></span>Fan</div>
   <div class="fanrow">
    <div><div class="value"><span id="d">--</span><span class="unit">%</span></div>
@@ -137,10 +137,34 @@ function state(cls, text) {
   $('state').textContent = text;
 }
 
+// No answer from the ESP32: say so, and stop showing old numbers as if they
+// were live. A device that has been switched off never answers at all, so
+// this must not wait for the browser to give up on its own.
+let lastOk = 0;
+function offline() {
+  state('bad', 'ESP32 not reachable');
+  ['ct', 'ch', 'cf'].forEach(id => $(id).classList.add('stale'));
+  $('t').textContent = '--'; $('h').textContent = '--';
+  $('d').textContent = '--'; $('r').textContent = '-- rpm';
+  $('db').style.width = '0';
+  $('rot').style.animationPlayState = 'paused';
+}
+setInterval(() => { if (Date.now() - lastOk > 3000) offline(); }, 1000);
+
 async function tick() {
   let s;
-  try { s = await (await fetch('/status.json')).json(); }
-  catch (e) { state('bad', 'ESP32 not reachable'); return; }
+  try {
+    // Give up on a request after 2 s instead of waiting for the browser.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2000);
+    s = await (await fetch('/status.json', { signal: ctl.signal, cache: 'no-store' })).json();
+    clearTimeout(timer);
+  } catch (e) {
+    offline();
+    return;
+  }
+  lastOk = Date.now();
+  $('cf').classList.remove('stale');
 
   const link = s.ok > 0 && s.age_ms < 3000;
   if (!link) state('bad', 'No data from the STM32');
@@ -176,7 +200,12 @@ async function tick() {
 
   $('foot').textContent = 'lines from the STM32: ' + s.ok + ' good, ' + s.bad + ' bad';
 }
-setInterval(tick, 1000);
-tick();
+// The next request only goes out once the last one has finished, so requests
+// to a device that is not answering never pile up.
+async function loop() {
+  await tick();
+  setTimeout(loop, 1000);
+}
+loop();
 </script></body></html>
 )html";
