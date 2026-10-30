@@ -1,3 +1,4 @@
+#include "page.h"    // PAGE, the web page
 #include "secrets.h" // WIFI_SSID and WIFI_PASS, not in git
 #include <Arduino.h>
 #include <ArduinoOTA.h> // upload new firmware over WiFi
@@ -73,39 +74,6 @@ static void handle_line(const char *s) {
     Serial.printf("did not understand: %s\n", s);
   }
 }
-
-// The page itself. It asks the ESP32 for /status.json once a second and
-// puts the numbers on the screen.
-static const char PAGE[] = R"html(<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Smart fan</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:24px}
-.l{color:#888;margin-top:20px}.v{font-size:44px;font-weight:600}
-#link{margin-top:28px;color:#888}
-</style></head><body>
-<div class="l">Temperature</div><div class="v" id="t">--</div>
-<div class="l">Humidity</div><div class="v" id="h">--</div>
-<div class="l">Fan speed</div><div class="v" id="f">--</div>
-<div id="link">waiting...</div>
-<script>
-const $ = id => document.getElementById(id);
-async function tick() {
-  try {
-    const s = await (await fetch('/status.json')).json();
-    $('t').textContent = s.fresh ? s.t.toFixed(1) + ' °C' : '--';
-    $('h').textContent = s.fresh ? s.h.toFixed(1) + ' %' : '--';
-    $('f').textContent = s.duty + ' %  ' + s.rpm + ' rpm';
-    $('link').textContent = (s.ok > 0 && s.age_ms < 3000)
-        ? 'STM32 link ok' : 'no data from the STM32';
-  } catch (e) {
-    $('link').textContent = 'ESP32 not reachable';
-  }
-}
-setInterval(tick, 1000);
-tick();
-</script></body></html>)html";
 
 static void send_page() { server.send(200, "text/html", PAGE); }
 
