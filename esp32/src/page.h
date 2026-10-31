@@ -198,7 +198,8 @@ async function tick() {
     $('duty').value = s.duty; $('dv').textContent = s.duty + ' %'; synced = true;
   }
 
-  $('foot').textContent = 'lines from the STM32: ' + s.ok + ' good, ' + s.bad + ' bad';
+    $('foot').textContent = 'lines from the STM32: ' + s.ok + ' good, ' + s.bad + ' bad, MQTT ' +
+      (s.mqtt === 0 ? 'connected' : 'not connected (' + s.mqtt + ')');
 }
 // The next request only goes out once the last one has finished, so requests
 // to a device that is not answering never pile up.
