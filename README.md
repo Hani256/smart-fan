@@ -30,6 +30,8 @@ on that below, because it turned out to be the most interesting part.
 - An ESP32 on the same board joins the home WiFi and serves a dashboard with
   live values, the last five minutes as small graphs, and the mode controls.
   Its firmware is updated over WiFi
+- Publishes its state over MQTT and takes mode commands from there too, so
+  it fits into a home automation setup without going through the web page
 - 47 unit tests for the control logic, the serial protocol on both ends and
   the ESP32's line parser, run by GitHub Actions on every push, once plainly
   and once under AddressSanitizer and UndefinedBehaviorSanitizer, together
@@ -87,7 +89,7 @@ flowchart LR
   LINK["LinkTask<br/>status out, 1 s"]
   LRX["LinkRxTask<br/>commands in"]
   BT["ButtonTask<br/>debounce"]
-  ESP["ESP32<br/>WiFi and web page"]
+  ESP["ESP32<br/>WiFi, web page, MQTT"]
 
   SENS -- "q_sensor (mailbox)" --> FAN
   SENS -- "q_sensor" --> LINK
@@ -198,8 +200,30 @@ Some details that took some finding:
   meanwhile
 - The board layout leaves no room for a USB cable on the ESP32, so after the
   first upload all updates go over WiFi (OTA), protected by a password
-- The WiFi and OTA passwords are in files that git ignores. Example files
+- The WiFi, OTA and MQTT passwords are in files that git ignores. Example files
   with placeholders are in the repository
+
+### MQTT
+
+The ESP32 also connects to an MQTT broker (Mosquitto, running on my Mac,
+with a user name and password) and keeps trying every 10 s when the broker
+is not there. The web page shows whether it is connected.
+
+| Topic | Direction | Content |
+|---|---|---|
+| `smartfan/state` | ESP32 publishes, retained | `{"fresh":true,"t":23.8,"h":67.5,"duty":79,"rpm":2370,"mode":"A"}`, every second |
+| `smartfan/status` | ESP32 publishes, retained | `online`, or `offline` from the broker as the Last Will when the ESP32 drops off |
+| `smartfan/mode/set` | ESP32 subscribes | `A`, `O` or `M,<0-100>` |
+
+```
+mosquitto_sub -h <broker> -u smartfan -P <password> -t 'smartfan/#' -v
+mosquitto_pub -h <broker> -u smartfan -P <password> -t smartfan/mode/set -m "M,60"
+```
+
+A command is checked as strictly as one from the page: anything other than
+exactly those three forms, or a speed above 100, is ignored. Because the
+state is retained, a client that connects later gets the last reading
+straight away instead of waiting for the next one.
 
 ## Testing
 
